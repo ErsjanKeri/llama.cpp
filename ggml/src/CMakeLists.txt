@@ -221,6 +221,11 @@ if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()
 
+if (GGML_TENSOR_TRACE)
+    target_compile_definitions(ggml-base PUBLIC GGML_TENSOR_TRACE)
+    message(STATUS "Tensor access tracing ENABLED - all tensor operations will be logged")
+endif()
+
 add_library(ggml
             ggml-backend-reg.cpp)
 add_library(ggml::ggml ALIAS ggml)

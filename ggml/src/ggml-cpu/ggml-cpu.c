@@ -15,6 +15,10 @@
 #include "ops.h"
 #include "ggml.h"
 
+#ifdef GGML_TENSOR_TRACE
+#include "tensor_trace.h"
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -1229,6 +1233,27 @@ void ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+#ifdef GGML_TENSOR_TRACE
+    // Log tensor access BEFORE actual memory is touched
+    // This captures the REAL memory access pattern at CPU backend level
+    if (params->ith == 0) {  // Only log once per operation (first thread)
+        struct TensorAccessLog entry = {0};
+        entry.timestamp_ns = tensor_trace_get_timestamp_ns();
+        entry.operation_type = 1;  // MUL_MAT (TODO: use proper enum)
+        entry.thread_id = tensor_trace_get_thread_id();
+
+        // Log src0 access (weight matrix)
+        entry.tensor_ptr = (uint64_t)src0->data;
+        entry.size_bytes = (uint32_t)ggml_nbytes(src0);
+        tensor_trace_log(&entry);
+
+        // Log src1 access (input activations)
+        entry.tensor_ptr = (uint64_t)src1->data;
+        entry.size_bytes = (uint32_t)ggml_nbytes(src1);
+        tensor_trace_log(&entry);
+    }
+#endif
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
