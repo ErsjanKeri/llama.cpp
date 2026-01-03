@@ -223,8 +223,10 @@ endif()
 
 if (GGML_TENSOR_TRACE)
     target_compile_definitions(ggml-base PUBLIC GGML_TENSOR_TRACE)
+    target_sources(ggml-base PRIVATE tensor_trace.c ../include/tensor_trace.h)
     message(STATUS "Tensor access tracing ENABLED - all tensor operations will be logged")
 endif()
+
 
 add_library(ggml
             ggml-backend-reg.cpp)

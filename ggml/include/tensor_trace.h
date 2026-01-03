@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,7 +16,8 @@ enum TensorTracePhase {
     TRACE_PHASE_GENERATE = 1,
 };
 
-// 64-byte fixed-size log entry (cache-line aligned)
+// 128-byte fixed-size log entry (2x cache-line aligned)
+// Includes both direct tensor name (Path A - validation) and tensor_idx (Path B - efficient lookup)
 struct TensorAccessLog {
     // === Timestamp (8 bytes) ===
     uint64_t timestamp_ns;        // Nanoseconds since trace start
@@ -29,7 +32,7 @@ struct TensorAccessLog {
     uint32_t padding1b;           // Alignment
 
     // === Tensor Identification (20 bytes) ===
-    uint32_t tensor_idx;          // Index into tensor name table
+    uint32_t tensor_idx;          // Index into tensor name table (Path B - efficient)
     uint64_t tensor_ptr;          // Virtual address of tensor->data
     uint64_t file_offset;         // Offset in GGUF file (0 = not in file/intermediate)
     uint32_t size_bytes;          // Size of tensor in bytes
@@ -44,14 +47,31 @@ struct TensorAccessLog {
     uint8_t  expert_rank;         // Routing rank (0=top, 1=second, etc.)
     uint16_t routing_score;       // Quantized routing score (0-65535)
     uint32_t padding3;            // Alignment
-    uint32_t padding4;            // Final padding to reach 64 bytes
+    uint32_t padding4;            // Final padding
 
-    // Total: 64 bytes (verified at compile time)
+    // === Direct Tensor Name (64 bytes) - Path A for validation ===
+    char tensor_name[64];         // Tensor name from ggml_tensor->name (e.g., "blk.5.attn_q.weight")
+
+    // Total: 128 bytes (verified at compile time)
 } __attribute__((packed));
 
-// Static assertion to ensure struct is exactly 64 bytes
-_Static_assert(sizeof(struct TensorAccessLog) == 64,
-               "TensorAccessLog must be exactly 64 bytes");
+// Static assertion to ensure struct is exactly 128 bytes
+_Static_assert(sizeof(struct TensorAccessLog) == 128,
+               "TensorAccessLog must be exactly 128 bytes");
+
+// === Helper Functions ===
+
+// Extract layer ID from tensor name (e.g., "blk.5.attn_q.weight" → 5)
+// Returns 65535 (UINT16_MAX) for non-layer tensors (embeddings, output, etc.)
+static inline uint16_t tensor_trace_extract_layer_id(const char* name) {
+    if (name && strncmp(name, "blk.", 4) == 0) {
+        int layer = -1;
+        if (sscanf(name + 4, "%d", &layer) == 1 && layer >= 0 && layer < 65535) {
+            return (uint16_t)layer;
+        }
+    }
+    return 65535;  // Not a layer tensor
+}
 
 // === API Functions ===
 
@@ -84,6 +104,14 @@ uint64_t tensor_trace_get_timestamp_ns(void);
 
 // Get current thread ID (Linux-specific)
 uint16_t tensor_trace_get_thread_id(void);
+
+// Lookup tensor index by data pointer (Path B - efficient lookup)
+// Returns tensor_idx if found, UINT32_MAX if not found
+uint32_t tensor_trace_lookup_idx(void* data_ptr);
+
+// Dump registry table to file (for validation and analysis)
+// Outputs CSV: tensor_idx,tensor_name,data_ptr,file_offset,size_bytes,layer_id
+void tensor_trace_dump_registry(const char* output_path);
 
 #ifdef __cplusplus
 }

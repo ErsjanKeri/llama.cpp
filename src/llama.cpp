@@ -12,6 +12,9 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#ifdef GGML_TENSOR_TRACE
+#include "tensor_trace.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -967,6 +970,11 @@ static struct llama_model * llama_model_load_from_file_impl(
         llama_model_free(model);
         return nullptr;
     }
+    // TODO: initialising 2 Gb tensor trace buffer for now; make this configurable later
+    #ifdef GGML_TENSOR_TRACE
+        tensor_trace_init("/tmp/tensor_trace.bin", 2ULL * 1024 * 1024 * 1024);
+        LLAMA_LOG_INFO("%s: tensor tracing initialized\n", __func__);
+    #endif
 
     return model;
 }

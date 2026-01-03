@@ -25,17 +25,34 @@ static int g_log_fd = -1;              // File descriptor for log file
 static uint64_t g_trace_start_ns = 0;  // Trace start time (for relative timestamps)
 
 // Thread-local buffer for batching writes (avoid contention)
-#define THREAD_LOCAL_BUFFER_SIZE 1024  // 1024 entries = 64KB per thread
+#define THREAD_LOCAL_BUFFER_SIZE 1024  // 1024 entries = 128KB per thread (128 bytes each)
 static __thread struct TensorAccessLog g_thread_local_buffer[THREAD_LOCAL_BUFFER_SIZE];
 static __thread size_t g_thread_local_offset = 0;
 
+// === Tensor Registration Table (Path B) ===
+
+#define MAX_REGISTERED_TENSORS 1024  // TinyLlama has ~201 tensors, use 1024 for safety
+
+struct TensorRegistryEntry {
+    void* data_ptr;          // Memory address (key for lookup)
+    char name[64];           // Tensor name (e.g., "blk.5.attn_q.weight")
+    uint64_t file_offset;    // Offset in GGUF file
+    uint64_t size_bytes;     // Size in bytes
+    uint16_t layer_id;       // Extracted layer ID
+    uint32_t tensor_idx;     // Index in registry (for trace logs)
+};
+
+static struct TensorRegistryEntry g_tensor_registry[MAX_REGISTERED_TENSORS];
+static uint32_t g_registry_count = 0;  // Number of registered tensors
+
 // === Helper Functions ===
 
-// Get current timestamp in nanoseconds
+// Get current timestamp in nanoseconds (relative to trace start)
 uint64_t tensor_trace_get_timestamp_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    return now - g_trace_start_ns;  // Return relative time since trace start
 }
 
 // Get current thread ID (Linux-specific)
@@ -168,11 +185,69 @@ void tensor_trace_register_tensor(
     uint64_t file_offset,
     uint64_t size_bytes)
 {
-    // TODO: Implement tensor registration
-    // For MVP, we'll skip this and just log raw pointers
-    // Phase 2 will add a proper hash map for tensor_ptr → metadata lookup
-    (void)name;
-    (void)data_ptr;
-    (void)file_offset;
-    (void)size_bytes;
+    // Check capacity
+    if (g_registry_count >= MAX_REGISTERED_TENSORS) {
+        fprintf(stderr, "[TENSOR_TRACE] Warning: Registry full, cannot register '%s'\n", name);
+        return;
+    }
+
+    // Store tensor metadata
+    struct TensorRegistryEntry* entry = &g_tensor_registry[g_registry_count];
+    entry->data_ptr = data_ptr;
+    entry->file_offset = file_offset;
+    entry->size_bytes = size_bytes;
+    entry->tensor_idx = g_registry_count;
+
+    // Copy name (safely)
+    strncpy(entry->name, name ? name : "", sizeof(entry->name) - 1);
+    entry->name[sizeof(entry->name) - 1] = '\0';
+
+    // Extract layer ID from name
+    entry->layer_id = tensor_trace_extract_layer_id(entry->name);
+
+    g_registry_count++;
+
+    // Debug: Log registration (can be disabled later)
+    // printf("[TENSOR_TRACE] Registered tensor %u: %s (ptr=%p, offset=%llu, size=%llu, layer=%u)\n",
+    //        entry->tensor_idx, entry->name, data_ptr, file_offset, size_bytes, entry->layer_id);
+}
+
+// Lookup tensor by data pointer (returns tensor_idx, or UINT32_MAX if not found)
+uint32_t tensor_trace_lookup_idx(void* data_ptr) {
+    // Simple linear search (fine for ~201 tensors)
+    // Could optimize with hash table if needed for larger models
+    for (uint32_t i = 0; i < g_registry_count; i++) {
+        if (g_tensor_registry[i].data_ptr == data_ptr) {
+            return i;  // Found!
+        }
+    }
+    return UINT32_MAX;  // Not found
+}
+
+// Dump registry table to CSV file for validation
+void tensor_trace_dump_registry(const char* output_path) {
+    FILE* f = fopen(output_path, "w");
+    if (!f) {
+        fprintf(stderr, "[TENSOR_TRACE] Error: Failed to open %s for writing: %s\n",
+                output_path, strerror(errno));
+        return;
+    }
+
+    // Write CSV header
+    fprintf(f, "tensor_idx,tensor_name,data_ptr,file_offset,size_bytes,layer_id\n");
+
+    // Write all registered tensors
+    for (uint32_t i = 0; i < g_registry_count; i++) {
+        struct TensorRegistryEntry* entry = &g_tensor_registry[i];
+        fprintf(f, "%u,%s,%p,%llu,%llu,%u\n",
+                entry->tensor_idx,
+                entry->name,
+                entry->data_ptr,
+                entry->file_offset,
+                entry->size_bytes,
+                entry->layer_id);
+    }
+
+    fclose(f);
+    printf("[TENSOR_TRACE] Dumped %u tensors to %s\n", g_registry_count, output_path);
 }

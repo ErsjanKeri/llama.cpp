@@ -1246,11 +1246,23 @@ void ggml_compute_forward_mul_mat(
         // Log src0 access (weight matrix)
         entry.tensor_ptr = (uint64_t)src0->data;
         entry.size_bytes = (uint32_t)ggml_nbytes(src0);
+        // Path A: Copy tensor name directly for validation
+        strncpy(entry.tensor_name, src0->name, sizeof(entry.tensor_name) - 1);
+        entry.tensor_name[sizeof(entry.tensor_name) - 1] = '\0';  // Ensure null termination
+        entry.layer_id = tensor_trace_extract_layer_id(src0->name);
+        // Path B: Lookup tensor_idx from registry
+        entry.tensor_idx = tensor_trace_lookup_idx(src0->data);
         tensor_trace_log(&entry);
 
         // Log src1 access (input activations)
         entry.tensor_ptr = (uint64_t)src1->data;
         entry.size_bytes = (uint32_t)ggml_nbytes(src1);
+        // Path A: Copy tensor name directly for validation
+        strncpy(entry.tensor_name, src1->name, sizeof(entry.tensor_name) - 1);
+        entry.tensor_name[sizeof(entry.tensor_name) - 1] = '\0';  // Ensure null termination
+        entry.layer_id = tensor_trace_extract_layer_id(src1->name);
+        // Path B: Lookup tensor_idx from registry
+        entry.tensor_idx = tensor_trace_lookup_idx(src1->data);
         tensor_trace_log(&entry);
     }
 #endif

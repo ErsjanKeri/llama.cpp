@@ -11,7 +11,10 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-cpp.h"
-
+#include "ggml-cpp.h"
+#ifdef GGML_TENSOR_TRACE
+#include "tensor_trace.h"
+#endif
 #include "models/models.h"
 
 #include <algorithm>
@@ -7913,6 +7916,10 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+    // TODO: placing it here for now 
+    #ifdef GGML_TENSOR_TRACE
+        tensor_trace_shutdown();
+    #endif
     delete model;
 }
 
