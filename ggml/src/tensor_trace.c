@@ -15,6 +15,10 @@
 #include <sys/syscall.h>
 #endif
 
+// Forward declarations for buffer tracking (Phase 1.3)
+static void tensor_trace_init_buffer_stats(void);
+static void tensor_trace_shutdown_buffer_stats(void);
+
 // === Global State ===
 
 // Memory-mapped log buffer
@@ -25,9 +29,14 @@ static int g_log_fd = -1;              // File descriptor for log file
 static uint64_t g_trace_start_ns = 0;  // Trace start time (for relative timestamps)
 
 // Thread-local buffer for batching writes (avoid contention)
-#define THREAD_LOCAL_BUFFER_SIZE 1024  // 1024 entries = 128KB per thread (128 bytes each)
+#define THREAD_LOCAL_BUFFER_SIZE 512  // 512 entries = 128KB per thread (256 bytes each)
 static __thread struct TensorAccessLog g_thread_local_buffer[THREAD_LOCAL_BUFFER_SIZE];
 static __thread size_t g_thread_local_offset = 0;
+
+// Global execution context (Phase 1.1+)
+static int g_trace_enabled = 1;
+static uint8_t g_current_phase = TRACE_PHASE_PROMPT;
+static uint32_t g_current_token_id = 0;
 
 // === Tensor Registration Table (Path B) ===
 
@@ -107,6 +116,9 @@ void tensor_trace_init(const char* log_path, size_t capacity_bytes) {
     g_log_capacity = capacity_bytes;
     g_log_offset = 0;
 
+    // Initialize buffer stats tracking (Phase 1.3)
+    tensor_trace_init_buffer_stats();
+
     printf("[TENSOR_TRACE] Initialized: %s (%.2f GB capacity)\n",
            log_path, capacity_bytes / (1024.0 * 1024.0 * 1024.0));
 }
@@ -171,6 +183,9 @@ void tensor_trace_shutdown(void) {
     size_t num_entries = g_log_offset / sizeof(struct TensorAccessLog);
     printf("[TENSOR_TRACE] Shutdown: %zu entries logged (%.2f MB)\n",
            num_entries, g_log_offset / (1024.0 * 1024.0));
+
+    // Shutdown buffer stats tracking (Phase 1.3)
+    tensor_trace_shutdown_buffer_stats();
 
     // Reset state
     g_log_buffer = NULL;
@@ -250,4 +265,251 @@ void tensor_trace_dump_registry(const char* output_path) {
 
     fclose(f);
     printf("[TENSOR_TRACE] Dumped %u tensors to %s\n", g_registry_count, output_path);
+}
+
+// === Buffer Tracking (Phase 1.3) ===
+
+// Buffer stats output file (JSONL format for streaming)
+static FILE * g_buffer_stats_file = NULL;
+
+// Initialize buffer stats file
+static void tensor_trace_init_buffer_stats(void) {
+    g_buffer_stats_file = fopen("/tmp/buffer_stats.jsonl", "w");
+    if (g_buffer_stats_file == NULL) {
+        fprintf(stderr, "[TENSOR_TRACE] Warning: Failed to open buffer_stats.jsonl: %s\n",
+                strerror(errno));
+    } else {
+        printf("[TENSOR_TRACE] Buffer stats logging to /tmp/buffer_stats.jsonl\n");
+    }
+}
+
+// Log buffer allocation event
+void tensor_trace_log_buffer_alloc(
+    uint64_t buffer_id,
+    void * buffer_ptr,
+    size_t size_bytes,
+    const char * buffer_name,
+    const char * backend_type,
+    uint8_t buffer_usage,
+    uint16_t layer_id) {
+
+    if (g_buffer_stats_file == NULL || !g_trace_enabled) {
+        return;
+    }
+
+    // Get timestamp (relative to trace start, for correlation with tensor ops)
+    uint64_t timestamp_ns = tensor_trace_get_timestamp_ns();
+
+    // Write as JSON line for easy parsing
+    fprintf(g_buffer_stats_file,
+        "{\"timestamp_ms\":%.3f,\"event\":\"alloc\",\"buffer_id\":%llu,"
+        "\"buffer_ptr\":%llu,\"size\":%zu,\"name\":\"%s\",\"backend\":\"%s\","
+        "\"usage\":%u,\"layer\":%u}\n",
+        timestamp_ns / 1e6,
+        (unsigned long long)buffer_id,
+        (unsigned long long)buffer_ptr,
+        size_bytes,
+        buffer_name ? buffer_name : "unnamed",
+        backend_type ? backend_type : "unknown",
+        buffer_usage,
+        layer_id
+    );
+    fflush(g_buffer_stats_file);
+}
+
+// Log buffer deallocation event
+void tensor_trace_log_buffer_dealloc(uint64_t buffer_id) {
+    if (g_buffer_stats_file == NULL || !g_trace_enabled) {
+        return;
+    }
+
+    // Get timestamp (for correlation)
+    uint64_t timestamp_ns = tensor_trace_get_timestamp_ns();
+
+    fprintf(g_buffer_stats_file,
+        "{\"timestamp_ms\":%.3f,\"event\":\"dealloc\",\"buffer_id\":%llu}\n",
+        timestamp_ns / 1e6,
+        (unsigned long long)buffer_id
+    );
+    fflush(g_buffer_stats_file);
+}
+
+// Shutdown buffer stats
+static void tensor_trace_shutdown_buffer_stats(void) {
+    if (g_buffer_stats_file != NULL) {
+        fclose(g_buffer_stats_file);
+        g_buffer_stats_file = NULL;
+        printf("[TENSOR_TRACE] Buffer stats closed\n");
+    }
+}
+
+// === NEW: Generic Operation Logging (Phase 1.1) ===
+
+// Include ggml headers for tensor types
+#include "ggml.h"
+#include "ggml-backend.h"
+
+// Disk offset storage (Phase 1.2)
+// Maps tensor name to GGUF file offset
+#define MAX_OFFSET_MAP_SIZE 2048
+static struct {
+    char name[64];
+    uint64_t offset;
+} g_offset_map[MAX_OFFSET_MAP_SIZE];
+static uint32_t g_offset_map_count = 0;
+
+// Register tensor disk offset (called from llama during model load)
+void tensor_trace_register_disk_offset(const char * name, uint64_t offset) {
+    if (name == NULL || g_offset_map_count >= MAX_OFFSET_MAP_SIZE) {
+        return;
+    }
+
+    strncpy(g_offset_map[g_offset_map_count].name, name, sizeof(g_offset_map[0].name) - 1);
+    g_offset_map[g_offset_map_count].name[sizeof(g_offset_map[0].name) - 1] = '\0';
+    g_offset_map[g_offset_map_count].offset = offset;
+    g_offset_map_count++;
+}
+
+// Lookup disk offset by tensor name
+static uint64_t tensor_trace_lookup_disk_offset(const char * name) {
+    if (name == NULL) return 0;
+
+    for (uint32_t i = 0; i < g_offset_map_count; i++) {
+        if (strcmp(g_offset_map[i].name, name) == 0) {
+            return g_offset_map[i].offset;
+        }
+    }
+    return 0;
+}
+
+// === Memory Source Detection (Phase 1.2) ===
+// Uses buffer API to determine if tensor is from GGUF file or runtime buffer
+
+enum MemorySource tensor_trace_detect_memory_source(const struct ggml_tensor * tensor) {
+    if (tensor == NULL || tensor->buffer == NULL) {
+        return MEMORY_SOURCE_BUFFER;  // Default to buffer if unknown
+    }
+
+    // Query buffer usage type from ggml backend API
+    ggml_backend_buffer_t buf = tensor->buffer;
+    enum ggml_backend_buffer_usage usage = ggml_backend_buffer_get_usage(buf);
+
+    if (usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return MEMORY_SOURCE_DISK;  // Model weights from GGUF file
+    } else {
+        // GGML_BACKEND_BUFFER_USAGE_COMPUTE or GGML_BACKEND_BUFFER_USAGE_ANY
+        return MEMORY_SOURCE_BUFFER;  // Runtime buffers (KV cache, scratch, activations)
+    }
+}
+
+uint64_t tensor_trace_get_disk_offset(const struct ggml_tensor * tensor) {
+    if (tensor == NULL) {
+        return 0;
+    }
+
+    // Get tensor name
+    const char * name = ggml_get_name(tensor);
+    if (name == NULL || name[0] == '\0') {
+        return 0;  // Unnamed tensor (intermediate result)
+    }
+
+    // Lookup from registered offset map
+    return tensor_trace_lookup_disk_offset(name);
+}
+
+uint64_t tensor_trace_get_buffer_id(const struct ggml_tensor * tensor) {
+    // PLACEHOLDER: Use tensor pointer as buffer ID for now
+    // This will be properly implemented in Phase 1.2
+    if (tensor == NULL || tensor->buffer == NULL) {
+        return 0;
+    }
+    return (uint64_t)tensor->buffer;
+}
+
+// Main generic operation logging function
+// Called from ggml_compute_forward() dispatcher BEFORE switch statement
+// Creates ONE entry per operation with ALL sources embedded
+void tensor_trace_log_operation(
+    const struct ggml_tensor * dst,
+    int ith) {
+
+    if (!g_trace_enabled || dst == NULL) {
+        return;
+    }
+
+    // Only first thread logs (avoid duplicate entries)
+    if (ith != 0) {
+        return;
+    }
+
+    // Create ONE trace entry for this operation
+    struct TensorAccessLog entry = {0};  // Zero-initialize all fields
+
+    // === Fill Operation Metadata ===
+    entry.timestamp_ns = tensor_trace_get_timestamp_ns();
+    entry.thread_id = tensor_trace_get_thread_id();
+    entry.operation_type = (uint8_t)dst->op;  // Use ggml_op enum directly
+    entry.phase = g_current_phase;
+    entry.token_id = g_current_token_id;
+
+    // === Fill Destination Tensor ===
+    const char * dst_name = ggml_get_name(dst);
+    if (dst_name != NULL) {
+        strncpy(entry.dst_name, dst_name, sizeof(entry.dst_name) - 1);
+        entry.dst_name[sizeof(entry.dst_name) - 1] = '\0';
+    }
+
+    // Extract layer ID from destination or first source
+    entry.layer_id = tensor_trace_extract_layer_id(dst_name);
+
+    // === Fill ALL Source Tensors ===
+    entry.num_sources = 0;
+
+    for (int i = 0; i < GGML_MAX_SRC && i < 4; i++) {  // Max 4 sources in our struct
+        const struct ggml_tensor * src = dst->src[i];
+
+        // Stop when we hit NULL (no more sources)
+        if (src == NULL) {
+            break;
+        }
+
+        // Skip if tensor has no data (shouldn't happen, but safety check)
+        if (src->data == NULL) {
+            continue;
+        }
+
+        // Fill this source's information
+        struct SourceTensorInfo * src_info = &entry.sources[entry.num_sources];
+
+        // Name
+        const char * src_name = ggml_get_name(src);
+        if (src_name != NULL) {
+            strncpy(src_info->name, src_name, sizeof(src_info->name) - 1);
+            src_info->name[sizeof(src_info->name) - 1] = '\0';
+        }
+
+        // Basic info
+        src_info->tensor_ptr = (uint64_t)src->data;
+        src_info->size_bytes = (uint32_t)ggml_nbytes(src);
+        src_info->layer_id = tensor_trace_extract_layer_id(src_name);
+        src_info->tensor_idx = tensor_trace_lookup_idx(src->data);
+
+        // Memory source detection (placeholder for now)
+        src_info->memory_source = tensor_trace_detect_memory_source(src);
+        if (src_info->memory_source == MEMORY_SOURCE_DISK) {
+            src_info->disk_offset_or_buffer_id = tensor_trace_get_disk_offset(src);
+        } else {
+            src_info->disk_offset_or_buffer_id = tensor_trace_get_buffer_id(src);
+        }
+
+        // If layer_id not set at operation level, try to get it from first source
+        if (entry.layer_id == 65535 && src_info->layer_id != 65535) {
+            entry.layer_id = src_info->layer_id;
+        }
+
+        entry.num_sources++;
+    }
+
+    // Log the single entry (contains operation + destination + all sources)
+    tensor_trace_log(&entry);
 }

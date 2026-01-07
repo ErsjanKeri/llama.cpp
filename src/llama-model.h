@@ -476,6 +476,13 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+#ifdef GGML_TENSOR_TRACE
+    // GGUF tensor offset tracking (for tensor tracing - Phase 1.2)
+    // Maps tensor name to its offset in the GGUF file
+    std::unordered_map<std::string, uint64_t> tensor_disk_offsets;  // tensor_name → offset in bytes
+    std::unordered_map<std::string, uint16_t> tensor_file_indices;  // tensor_name → file index (for split models)
+#endif
+
     // for keeping track of extra nodes used by lora adapters
     uint32_t n_lora_nodes = 0;
 
@@ -529,6 +536,21 @@ struct llama_model {
 
     // TODO: move this to new llm_arch_model_i interface
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
+
+#ifdef GGML_TENSOR_TRACE
+    // Helper methods for tensor tracing (Phase 1.2)
+    uint64_t get_tensor_disk_offset(const char * name) const {
+        if (name == nullptr) return 0;
+        auto it = tensor_disk_offsets.find(name);
+        return (it != tensor_disk_offsets.end()) ? it->second : 0;
+    }
+
+    uint16_t get_tensor_file_index(const char * name) const {
+        if (name == nullptr) return 0;
+        auto it = tensor_file_indices.find(name);
+        return (it != tensor_file_indices.end()) ? it->second : 0;
+    }
+#endif
 
 private:
     llama_model_params params;

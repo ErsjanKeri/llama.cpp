@@ -5,6 +5,10 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#ifdef GGML_TENSOR_TRACE
+#include "tensor_trace.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -191,6 +195,24 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
         ggml_backend_buffer_clear(buf, 0);
+
+#ifdef GGML_TENSOR_TRACE
+        // Log KV cache buffer allocation for tensor tracing (Phase 1.3)
+        const char * backend_name = ggml_backend_buffer_name(buf);
+        char buf_name[64];
+        snprintf(buf_name, sizeof(buf_name), "KVCache_%s", backend_name);
+
+        tensor_trace_log_buffer_alloc(
+            (uint64_t)buf,                              // buffer_id
+            ggml_backend_buffer_get_base(buf),          // buffer_ptr
+            ggml_backend_buffer_get_size(buf),          // size_bytes
+            buf_name,                                    // buffer_name
+            backend_name,                                // backend_type
+            GGML_BACKEND_BUFFER_USAGE_COMPUTE,          // buffer_usage (KV cache is compute-related)
+            65535                                        // layer_id (N/A, spans all layers)
+        );
+#endif
+
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 

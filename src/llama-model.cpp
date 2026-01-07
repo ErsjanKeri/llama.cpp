@@ -6882,6 +6882,23 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.second, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+#ifdef GGML_TENSOR_TRACE
+            // Log buffer allocation for tensor tracing (Phase 1.3)
+            const char * backend_name = ggml_backend_buffer_name(buf.second);
+            char buf_name[64];
+            snprintf(buf_name, sizeof(buf_name), "ModelWeights_file%u", buf.first);
+
+            tensor_trace_log_buffer_alloc(
+                (uint64_t)buf.second,                         // buffer_id
+                ggml_backend_buffer_get_base(buf.second),     // buffer_ptr
+                ggml_backend_buffer_get_size(buf.second),     // size_bytes
+                buf_name,                                      // buffer_name
+                backend_name,                                  // backend_type
+                GGML_BACKEND_BUFFER_USAGE_WEIGHTS,            // buffer_usage
+                65535                                          // layer_id (N/A for model weights)
+            );
+#endif
         }
 
         ctx_buf_maps.emplace_back(ctx, buf_map);
@@ -6934,6 +6951,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+#ifdef GGML_TENSOR_TRACE
+    // Store GGUF tensor offsets for tensor tracing (Phase 1.2)
+    LLAMA_LOG_INFO("%s: storing GGUF offsets for tensor tracing...\n", __func__);
+    for (const auto & [name, weight] : ml.weights_map) {
+        tensor_disk_offsets[name] = weight.offs;  // Byte offset in GGUF file (local copy)
+        tensor_file_indices[name] = weight.idx;   // File index (for split models)
+
+        // Register with tensor_trace for runtime lookup
+        tensor_trace_register_disk_offset(name.c_str(), weight.offs);
+    }
+    LLAMA_LOG_INFO("%s: stored %zu tensor offsets\n", __func__, tensor_disk_offsets.size());
+#endif
 
     return true;
 }

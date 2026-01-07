@@ -841,6 +841,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+#ifdef GGML_TENSOR_TRACE
+        // Dump computation graph to Graphviz format (per-token)
+        {
+            static bool graphs_dir_created = false;
+            static int graph_dump_counter = 0;
+
+            if (!graphs_dir_created) {
+                system("mkdir -p /tmp/graphs");
+                graphs_dir_created = true;
+            }
+
+            char dot_filename[256];
+            snprintf(dot_filename, sizeof(dot_filename),
+                     "/tmp/graphs/token_%05d.dot", graph_dump_counter++);
+            ggml_graph_dump_dot(gf, NULL, dot_filename);
+        }
+#endif
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;

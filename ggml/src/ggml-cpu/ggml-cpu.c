@@ -1234,38 +1234,9 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-#ifdef GGML_TENSOR_TRACE
-    // Log tensor access BEFORE actual memory is touched
-    // This captures the REAL memory access pattern at CPU backend level
-    if (params->ith == 0) {  // Only log once per operation (first thread)
-        struct TensorAccessLog entry = {0};
-        entry.timestamp_ns = tensor_trace_get_timestamp_ns();
-        entry.operation_type = 1;  // MUL_MAT (TODO: use proper enum)
-        entry.thread_id = tensor_trace_get_thread_id();
-
-        // Log src0 access (weight matrix)
-        entry.tensor_ptr = (uint64_t)src0->data;
-        entry.size_bytes = (uint32_t)ggml_nbytes(src0);
-        // Path A: Copy tensor name directly for validation
-        strncpy(entry.tensor_name, src0->name, sizeof(entry.tensor_name) - 1);
-        entry.tensor_name[sizeof(entry.tensor_name) - 1] = '\0';  // Ensure null termination
-        entry.layer_id = tensor_trace_extract_layer_id(src0->name);
-        // Path B: Lookup tensor_idx from registry
-        entry.tensor_idx = tensor_trace_lookup_idx(src0->data);
-        tensor_trace_log(&entry);
-
-        // Log src1 access (input activations)
-        entry.tensor_ptr = (uint64_t)src1->data;
-        entry.size_bytes = (uint32_t)ggml_nbytes(src1);
-        // Path A: Copy tensor name directly for validation
-        strncpy(entry.tensor_name, src1->name, sizeof(entry.tensor_name) - 1);
-        entry.tensor_name[sizeof(entry.tensor_name) - 1] = '\0';  // Ensure null termination
-        entry.layer_id = tensor_trace_extract_layer_id(src1->name);
-        // Path B: Lookup tensor_idx from registry
-        entry.tensor_idx = tensor_trace_lookup_idx(src1->data);
-        tensor_trace_log(&entry);
-    }
-#endif
+// NOTE: Old mul_mat-only instrumentation removed in Phase 1.1.3
+// Now using generic instrumentation at ggml_compute_forward() level (line ~1727)
+// which captures ALL operations, not just mul_mat
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1722,6 +1693,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
+
+    // === GENERIC TENSOR TRACING INSTRUMENTATION ===
+    #ifdef GGML_TENSOR_TRACE
+    if (params->ith == 0) {  // Only first thread logs
+        tensor_trace_log_operation(tensor, params->ith);
+    }
+    #endif
+    // ===============================================
 
     switch (tensor->op) {
         case GGML_OP_DUP:
