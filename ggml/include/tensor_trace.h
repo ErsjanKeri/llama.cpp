@@ -36,9 +36,12 @@ struct SourceTensorInfo {
     uint8_t  padding2[4];         // Alignment to 160 bytes
 } __attribute__((packed));
 
-// Static assertion for source info size
-_Static_assert(sizeof(struct SourceTensorInfo) == 160,
-               "SourceTensorInfo must be exactly 160 bytes");
+// Static assertion for source info size (compatible with C and C++)
+#ifdef __cplusplus
+static_assert(sizeof(struct SourceTensorInfo) == 160, "SourceTensorInfo must be exactly 160 bytes");
+#else
+_Static_assert(sizeof(struct SourceTensorInfo) == 160, "SourceTensorInfo must be exactly 160 bytes");
+#endif
 
 // === Main Log Entry: ONE entry per operation (1024 bytes, 16 cache lines) ===
 // Contains operation metadata + destination + ALL source tensors
@@ -69,9 +72,12 @@ struct TensorAccessLog {
     // Total: 24 + 128 + 640 + 232 = 1024 bytes (verified at compile time)
 } __attribute__((packed));
 
-// Static assertion to ensure struct is exactly 1024 bytes
-_Static_assert(sizeof(struct TensorAccessLog) == 1024,
-               "TensorAccessLog must be exactly 1024 bytes");
+// Static assertion to ensure struct is exactly 1024 bytes (compatible with C and C++)
+#ifdef __cplusplus
+static_assert(sizeof(struct TensorAccessLog) == 1024, "TensorAccessLog must be exactly 1024 bytes");
+#else
+_Static_assert(sizeof(struct TensorAccessLog) == 1024, "TensorAccessLog must be exactly 1024 bytes");
+#endif
 
 // === Buffer Lifecycle Event (Phase 1.3) ===
 // Logs buffer allocations/deallocations for memory occupancy analysis
@@ -89,9 +95,12 @@ struct BufferEvent {
     uint8_t  _padding[12];        // Padding to reach 128 bytes (8+1+1+2+8+8+8+64+16+12=128)
 } __attribute__((packed));
 
-// Static assertion for BufferEvent size
-_Static_assert(sizeof(struct BufferEvent) == 128,
-               "BufferEvent must be exactly 128 bytes");
+// Static assertion for BufferEvent size (compatible with C and C++)
+#ifdef __cplusplus
+static_assert(sizeof(struct BufferEvent) == 128, "BufferEvent must be exactly 128 bytes");
+#else
+_Static_assert(sizeof(struct BufferEvent) == 128, "BufferEvent must be exactly 128 bytes");
+#endif
 
 // Buffer event types
 enum BufferEventType {
