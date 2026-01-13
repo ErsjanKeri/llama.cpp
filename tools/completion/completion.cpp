@@ -6,6 +6,10 @@
 #include "llama.h"
 #include "chat.h"
 
+#ifdef GGML_TENSOR_TRACE
+#include "tensor_trace.h"
+#endif
+
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -531,6 +535,10 @@ int main(int argc, char ** argv) {
     int n_consumed         = 0;
     int n_session_consumed = 0;
 
+#ifdef GGML_TENSOR_TRACE
+    int n_generated        = 0;  // Track generated token count for tensor tracing
+#endif
+
     std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
     std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
     std::ostringstream output_ss;     g_output_ss     = &output_ss;
@@ -668,6 +676,19 @@ int main(int argc, char ** argv) {
                 }
             }
 
+#ifdef GGML_TENSOR_TRACE
+            // Set tensor trace phase and token_id based on inference state
+            if (n_consumed < (int) embd_inp.size()) {
+                // PROMPT phase: Still processing input tokens
+                tensor_trace_set_phase(TRACE_PHASE_PROMPT);
+                tensor_trace_set_token_id(0);
+            } else {
+                // GENERATE phase: Generating new tokens
+                tensor_trace_set_phase(TRACE_PHASE_GENERATE);
+                tensor_trace_set_token_id(n_generated);
+            }
+#endif
+
             for (int i = 0; i < (int) embd.size(); i += params.n_batch) {
                 int n_eval = (int) embd.size() - i;
                 if (n_eval > params.n_batch) {
@@ -724,6 +745,11 @@ int main(int argc, char ** argv) {
 
             // decrement remaining sampling budget
             --n_remain;
+
+#ifdef GGML_TENSOR_TRACE
+            // increment generated token count for next iteration
+            ++n_generated;
+#endif
 
             LOG_DBG("n_remain: %d\n", n_remain);
         } else {

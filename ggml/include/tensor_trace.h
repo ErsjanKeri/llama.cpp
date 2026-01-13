@@ -22,10 +22,10 @@ enum MemorySource {
     MEMORY_SOURCE_BUFFER = 1  // Runtime buffers (KV cache, scratch, activations)
 };
 
-// === Source Tensor Information (52 bytes per source) ===
+// === Source Tensor Information (160 bytes per source) ===
 // Embedded in TensorAccessLog for each source tensor
 struct SourceTensorInfo {
-    char name[20];                // Tensor name (e.g., "blk.5.attn_q.weight")
+    char name[128];               // Tensor name - EXPANDED for full names + suffixes (e.g., "blk.5.attn_q.weight (view)")
     uint64_t tensor_ptr;          // Virtual address of tensor->data
     uint32_t size_bytes;          // Tensor size in bytes
     uint16_t layer_id;            // Extracted layer ID (65535=N/A)
@@ -33,14 +33,14 @@ struct SourceTensorInfo {
     uint8_t  padding1;            // Alignment
     uint64_t disk_offset_or_buffer_id;  // If DISK: offset in GGUF, if BUFFER: buffer ID
     uint32_t tensor_idx;          // Path B: index in registry (UINT32_MAX if not found)
-    uint8_t  padding2[4];         // Alignment to 52 bytes
+    uint8_t  padding2[4];         // Alignment to 160 bytes
 } __attribute__((packed));
 
 // Static assertion for source info size
-_Static_assert(sizeof(struct SourceTensorInfo) == 52,
-               "SourceTensorInfo must be exactly 52 bytes");
+_Static_assert(sizeof(struct SourceTensorInfo) == 160,
+               "SourceTensorInfo must be exactly 160 bytes");
 
-// === Main Log Entry: ONE entry per operation (256 bytes, 4 cache lines) ===
+// === Main Log Entry: ONE entry per operation (1024 bytes, 16 cache lines) ===
 // Contains operation metadata + destination + ALL source tensors
 struct TensorAccessLog {
     // === Operation Metadata (24 bytes) ===
@@ -53,22 +53,25 @@ struct TensorAccessLog {
     uint8_t  num_sources;         // Number of source tensors (0-4, most ops have 1-3)
     uint8_t  padding1[5];         // Alignment
 
-    // === Destination Tensor (24 bytes) ===
-    char dst_name[24];            // What's being computed (output tensor name)
+    // === Destination Tensor (128 bytes) ===
+    char dst_name[128];           // What's being computed (output tensor name) - EXPANDED for full names
 
-    // === Source Tensors (208 bytes = 4 × 52 bytes) ===
+    // === Source Tensors (640 bytes = 4 × 160 bytes) ===
     // sources[0]: Primary source (usually weight matrix)
     // sources[1]: Secondary source (usually input activations)
     // sources[2]: Tertiary source (optional, e.g., position indices for ROPE)
     // sources[3]: Quaternary source (rarely used, e.g., frequency factors)
     struct SourceTensorInfo sources[4];
 
-    // Total: 24 + 24 + 208 = 256 bytes (verified at compile time)
+    // === Padding (232 bytes) ===
+    uint8_t  padding2[232];       // Padding to 1024 bytes for cache alignment
+
+    // Total: 24 + 128 + 640 + 232 = 1024 bytes (verified at compile time)
 } __attribute__((packed));
 
-// Static assertion to ensure struct is exactly 256 bytes
-_Static_assert(sizeof(struct TensorAccessLog) == 256,
-               "TensorAccessLog must be exactly 256 bytes");
+// Static assertion to ensure struct is exactly 1024 bytes
+_Static_assert(sizeof(struct TensorAccessLog) == 1024,
+               "TensorAccessLog must be exactly 1024 bytes");
 
 // === Buffer Lifecycle Event (Phase 1.3) ===
 // Logs buffer allocations/deallocations for memory occupancy analysis
@@ -161,6 +164,15 @@ struct ggml_tensor;
 void tensor_trace_log_operation(
     const struct ggml_tensor * dst,
     int ith);
+
+// Set current inference phase (PROMPT or GENERATE)
+// Called from application code (e.g., llama-completion) to track phase
+void tensor_trace_set_phase(uint8_t phase);
+
+// Set current token ID being processed
+// Called from application code to track which generated token is being processed
+// During PROMPT: typically 0, During GENERATE: 0, 1, 2, ... for each output token
+void tensor_trace_set_token_id(uint32_t token_id);
 
 // Helper functions for memory source detection (implemented in Phase 1.2)
 enum MemorySource tensor_trace_detect_memory_source(const struct ggml_tensor * tensor);

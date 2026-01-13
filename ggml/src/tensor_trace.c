@@ -29,7 +29,7 @@ static int g_log_fd = -1;              // File descriptor for log file
 static uint64_t g_trace_start_ns = 0;  // Trace start time (for relative timestamps)
 
 // Thread-local buffer for batching writes (avoid contention)
-#define THREAD_LOCAL_BUFFER_SIZE 512  // 512 entries = 128KB per thread (256 bytes each)
+#define THREAD_LOCAL_BUFFER_SIZE 512  // 512 entries = 512KB per thread (1024 bytes each)
 static __thread struct TensorAccessLog g_thread_local_buffer[THREAD_LOCAL_BUFFER_SIZE];
 static __thread size_t g_thread_local_offset = 0;
 
@@ -448,7 +448,7 @@ void tensor_trace_log_operation(
     // === Fill Operation Metadata ===
     entry.timestamp_ns = tensor_trace_get_timestamp_ns();
     entry.thread_id = tensor_trace_get_thread_id();
-    entry.operation_type = (uint8_t)dst->op;  // Use ggml_op enum directly
+    entry.operation_type = (uint8_t)dst->op;  // Use ggml_op enum directly, TODO: the correlation does not seem perfect in our logging
     entry.phase = g_current_phase;
     entry.token_id = g_current_token_id;
 
@@ -512,4 +512,14 @@ void tensor_trace_log_operation(
 
     // Log the single entry (contains operation + destination + all sources)
     tensor_trace_log(&entry);
+}
+
+// Set current phase (PROMPT or GENERATE)
+void tensor_trace_set_phase(uint8_t phase) {
+    g_current_phase = phase;
+}
+
+// Set current token ID
+void tensor_trace_set_token_id(uint32_t token_id) {
+    g_current_token_id = token_id;
 }
