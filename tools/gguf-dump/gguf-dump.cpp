@@ -30,6 +30,7 @@ struct tensor_info {
     std::string component_type;
     uint32_t n_dims;
     uint64_t ne[4];  // dimensions
+    uint32_t tensor_type;  // GGML type (for size calculation)
 };
 
 // Extract layer ID from tensor name (e.g., "blk.5.attn_q.weight" → 5)
@@ -87,6 +88,15 @@ std::string determine_component_type(const char* name) {
     }
 
     return "Other";
+}
+
+// Detect if tensor is a MoE expert tensor (3D with _exps in name)
+bool is_moe_expert_tensor(const char* name, uint32_t n_dims) {
+    if (n_dims != 3) return false;
+
+    return (strstr(name, "ffn_down_exps") != NULL ||
+            strstr(name, "ffn_gate_exps") != NULL ||
+            strstr(name, "ffn_up_exps") != NULL);
 }
 
 // Read GGUF string (length-prefixed)
@@ -266,6 +276,9 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Store tensor type for later use
+        info.tensor_type = tensor_type;
+
         // Calculate tensor size (simplified - assumes element size based on type)
         // Type 0 = F32 (4 bytes), Type 1 = F16 (2 bytes), etc.
         size_t element_size = (tensor_type == 1) ? 2 : 4;  // Simplified
@@ -287,17 +300,43 @@ int main(int argc, char** argv) {
     printf("tensor_name,file_offset,size_bytes,layer_id,component_type,n_dims,dim0,dim1,dim2,dim3\n");
 
     for (const auto& t : tensors) {
-        printf("%s,%llu,%llu,%d,%s,%u,%llu,%llu,%llu,%llu\n",
-               t.name.c_str(),
-               t.offset,
-               t.size_bytes,
-               t.layer_id,
-               t.component_type.c_str(),
-               t.n_dims,
-               t.n_dims > 0 ? t.ne[0] : 0,
-               t.n_dims > 1 ? t.ne[1] : 0,
-               t.n_dims > 2 ? t.ne[2] : 0,
-               t.n_dims > 3 ? t.ne[3] : 0);
+        // Check if this is a MoE expert tensor that needs splitting
+        if (is_moe_expert_tensor(t.name.c_str(), t.n_dims)) {
+            // Split into individual expert entries
+            uint64_t n_experts = t.ne[2];  // Third dimension = number of experts
+            size_t element_size = (t.tensor_type == 1) ? 2 : 4;
+            uint64_t expert_size = t.ne[0] * t.ne[1] * element_size;  // Size of one expert slice
+
+            for (uint64_t exp_id = 0; exp_id < n_experts; exp_id++) {
+                uint64_t expert_offset = t.offset + (exp_id * expert_size);
+
+                // Output format: tensor_name[expert_id]
+                printf("%s[%llu],%llu,%llu,%d,%s Expert %llu,%u,%llu,%llu,0,0\n",
+                       t.name.c_str(),
+                       exp_id,
+                       expert_offset,
+                       expert_size,
+                       t.layer_id,
+                       t.component_type.c_str(),
+                       exp_id,
+                       2,  // n_dims = 2 for individual expert (not 3)
+                       t.ne[0],
+                       t.ne[1]);
+            }
+        } else {
+            // Normal tensor - output as before
+            printf("%s,%llu,%llu,%d,%s,%u,%llu,%llu,%llu,%llu\n",
+                   t.name.c_str(),
+                   t.offset,
+                   t.size_bytes,
+                   t.layer_id,
+                   t.component_type.c_str(),
+                   t.n_dims,
+                   t.n_dims > 0 ? t.ne[0] : 0,
+                   t.n_dims > 1 ? t.ne[1] : 0,
+                   t.n_dims > 2 ? t.ne[2] : 0,
+                   t.n_dims > 3 ? t.ne[3] : 0);
+        }
     }
 
     fprintf(stderr, "\nDumped %zu tensors\n", tensors.size());
