@@ -1,4 +1,5 @@
 #include "tensor_trace.h"
+#include "ggml.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -426,6 +427,33 @@ uint64_t tensor_trace_get_buffer_id(const struct ggml_tensor * tensor) {
     return (uint64_t)tensor->buffer;
 }
 
+// Extract expert IDs from MUL_MAT_ID / ADD_ID operations
+// Returns number of expert IDs extracted (0 if not a MoE operation)
+static uint8_t extract_expert_ids(const struct ggml_tensor * dst, int32_t * out_ids, uint8_t max_ids) {
+    // Check if this is a MUL_MAT_ID or ADD_ID operation
+    if (dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_ADD_ID) {
+        return 0;
+    }
+
+    // For MUL_MAT_ID and ADD_ID, src[2] contains the expert IDs tensor
+    const struct ggml_tensor * ids = dst->src[2];
+    if (ids == NULL || ids->data == NULL) {
+        return 0;
+    }
+
+    // The ids tensor shape is [n_expert_used, n_tokens]
+    // We extract the first n_expert_used IDs (for first token, or all tokens)
+    const int32_t * id_data = (const int32_t *)ids->data;
+    const uint64_t n_ids = ids->ne[0];  // Number of experts selected
+
+    uint8_t count = 0;
+    for (uint64_t i = 0; i < n_ids && count < max_ids; i++) {
+        out_ids[count++] = id_data[i];
+    }
+
+    return count;
+}
+
 // Main generic operation logging function
 // Called from ggml_compute_forward() dispatcher BEFORE switch statement
 // Creates ONE entry per operation with ALL sources embedded
@@ -509,6 +537,9 @@ void tensor_trace_log_operation(
 
         entry.num_sources++;
     }
+
+    // === Extract Expert IDs for MoE operations ===
+    entry.num_experts = extract_expert_ids(dst, entry.expert_ids, 16);
 
     // Log the single entry (contains operation + destination + all sources)
     tensor_trace_log(&entry);

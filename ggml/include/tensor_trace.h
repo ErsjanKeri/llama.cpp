@@ -66,10 +66,16 @@ struct TensorAccessLog {
     // sources[3]: Quaternary source (rarely used, e.g., frequency factors)
     struct SourceTensorInfo sources[4];
 
-    // === Padding (232 bytes) ===
-    uint8_t  padding2[232];       // Padding to 1024 bytes for cache alignment
+    // === MoE Expert IDs (65 bytes) ===
+    // For MUL_MAT_ID operations: which expert IDs were selected (0-31)
+    // For other operations: unused (all zeros)
+    int32_t expert_ids[16];       // Up to 16 expert IDs (64 bytes)
+    uint8_t num_experts;          // Number of valid expert IDs (1 byte)
 
-    // Total: 24 + 128 + 640 + 232 = 1024 bytes (verified at compile time)
+    // === Padding (167 bytes) ===
+    uint8_t  padding2[167];       // Padding to 1024 bytes for cache alignment
+
+    // Total: 24 + 128 + 640 + 64 + 1 + 167 = 1024 bytes (verified at compile time)
 } __attribute__((packed));
 
 // Static assertion to ensure struct is exactly 1024 bytes (compatible with C and C++)
