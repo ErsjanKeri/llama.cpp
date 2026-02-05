@@ -15,6 +15,102 @@
 #define GGUF_MAGIC 0x46554747  // "GGUF" in little-endian
 #define GGUF_VERSION 3
 
+// GGML type information for correct size calculation
+// Extracted from ggml/src/ggml.c type_traits array (lines 607-897)
+struct ggml_type_traits {
+    const char* type_name;
+    uint32_t blck_size;    // Block size (number of elements per block)
+    uint32_t type_size;    // Block size in bytes
+};
+
+// Type information table for all GGML quantization formats
+static const ggml_type_traits GGML_TYPE_TRAITS[] = {
+    // type_id: {name, blck_size, type_size_bytes}
+    {/*  0 */ "F32",      1,   4},   // float32
+    {/*  1 */ "F16",      1,   2},   // float16
+    {/*  2 */ "Q4_0",     32,  18},  // 32 elements in 18 bytes
+    {/*  3 */ "Q4_1",     32,  20},  // 32 elements in 20 bytes
+    {/*  4 */ "Q5_0",     32,  22},  // Q5_0 (not used in modern models)
+    {/*  5 */ "Q5_1",     32,  24},  // Q5_1 (not used in modern models)
+    {/*  6 */ "Q8_0",     32,  34},  // 32 elements in 34 bytes
+    {/*  7 */ "Q8_1",     32,  36},  // 32 elements in 36 bytes
+    {/*  8 */ "Q2_K",     256, 82},  // 256 elements in 82 bytes (QK_K)
+    {/*  9 */ "Q3_K_S",   256, 110}, // 256 elements in 110 bytes
+    {/* 10 */ "Q3_K_M",   256, 110}, // 256 elements in 110 bytes
+    {/* 11 */ "Q3_K_L",   256, 110}, // 256 elements in 110 bytes
+    {/* 12 */ "Q4_K",     256, 144}, // 256 elements in 144 bytes
+    {/* 13 */ "Q5_K",     256, 176}, // 256 elements in 176 bytes
+    {/* 14 */ "Q6_K",     256, 210}, // 256 elements in 210 bytes
+    {/* 15 */ "Q8_K",     256, 292}, // 256 elements in 292 bytes
+    {/* 16 */ "IQ2_XXS",  256, 66},  // 256 elements in 66 bytes
+    {/* 17 */ "IQ2_XS",   256, 74},  // 256 elements in 74 bytes
+    {/* 18 */ "IQ3_XXS",  256, 98},  // 256 elements in 98 bytes
+    {/* 19 */ "IQ1_S",    256, 50},  // 256 elements in 50 bytes
+    {/* 20 */ "IQ4_NL",   32,  18},  // 32 elements in 18 bytes
+    {/* 21 */ "IQ3_S",    256, 110}, // 256 elements in 110 bytes
+    {/* 22 */ "IQ2_S",    256, 82},  // 256 elements in 82 bytes
+    {/* 23 */ "IQ4_XS",   256, 136}, // 256 elements in 136 bytes
+    {/* 24 */ "I8",       1,   1},   // int8
+    {/* 25 */ "I16",      1,   2},   // int16
+    {/* 26 */ "I32",      1,   4},   // int32
+    {/* 27 */ "I64",      1,   8},   // int64
+    {/* 28 */ "F64",      1,   8},   // float64
+    {/* 29 */ "IQ1_M",    256, 56},  // 256 elements in 56 bytes
+    {/* 30 */ "BF16",     1,   2},   // bfloat16
+    {/* 31 */ "Q4_0_4_4", 32,  18},  // Q4_0 with 4x4 blocking
+    {/* 32 */ "Q4_0_4_8", 32,  18},  // Q4_0 with 4x8 blocking
+    {/* 33 */ "Q4_0_8_8", 32,  18},  // Q4_0 with 8x8 blocking
+    {/* 34 */ "TQ1_0",    256, 50},  // Ternary quantization
+    {/* 35 */ "TQ2_0",    256, 66},  // Ternary quantization
+};
+
+#define GGML_TYPE_COUNT 36
+
+// Type 39 (MXFP4) - handled separately as it comes after the main array
+#define GGML_TYPE_MXFP4 39
+static const ggml_type_traits GGML_TYPE_MXFP4_TRAITS = {"MXFP4", 32, 17};
+
+/**
+ * Calculate correct tensor size accounting for quantization.
+ *
+ * @param tensor_type GGML type ID (0=F32, 1=F16, 12=Q4_K, 39=MXFP4, etc.)
+ * @param n_dims Number of dimensions
+ * @param ne Array of dimension sizes
+ * @return Size in bytes
+ */
+static uint64_t calculate_tensor_size(uint32_t tensor_type, uint32_t n_dims, const uint64_t* ne) {
+    // Get type traits
+    const ggml_type_traits* traits = nullptr;
+
+    if (tensor_type == GGML_TYPE_MXFP4) {
+        // Special case for MXFP4 (type 39)
+        traits = &GGML_TYPE_MXFP4_TRAITS;
+    } else if (tensor_type < GGML_TYPE_COUNT) {
+        // Standard types (0-35)
+        traits = &GGML_TYPE_TRAITS[tensor_type];
+    } else {
+        // Unknown type - fallback to F32 assumption (4 bytes)
+        fprintf(stderr, "Warning: Unknown tensor type %u, assuming F32\n", tensor_type);
+        traits = &GGML_TYPE_TRAITS[0];  // F32
+    }
+
+    // Calculate total number of elements
+    uint64_t n_elements = 1;
+    for (uint32_t d = 0; d < n_dims; d++) {
+        n_elements *= ne[d];
+    }
+
+    // Calculate size based on quantization
+    if (traits->blck_size == 1) {
+        // Non-quantized: simple multiplication
+        return n_elements * traits->type_size;
+    } else {
+        // Quantized: calculate number of blocks (round up)
+        uint64_t n_blocks = (n_elements + traits->blck_size - 1) / traits->blck_size;
+        return n_blocks * traits->type_size;
+    }
+}
+
 struct gguf_header {
     uint32_t magic;
     uint32_t version;
@@ -279,13 +375,8 @@ int main(int argc, char** argv) {
         // Store tensor type for later use
         info.tensor_type = tensor_type;
 
-        // Calculate tensor size (simplified - assumes element size based on type)
-        // Type 0 = F32 (4 bytes), Type 1 = F16 (2 bytes), etc.
-        size_t element_size = (tensor_type == 1) ? 2 : 4;  // Simplified
-        info.size_bytes = element_size;
-        for (uint32_t d = 0; d < info.n_dims; d++) {
-            info.size_bytes *= info.ne[d];
-        }
+        // Calculate tensor size using correct quantization-aware function
+        info.size_bytes = calculate_tensor_size(tensor_type, info.n_dims, info.ne);
 
         // Extract layer ID and component type
         info.layer_id = extract_layer_id(info.name.c_str());
@@ -294,7 +385,19 @@ int main(int argc, char** argv) {
         tensors.push_back(info);
     }
 
+    // Calculate data section offset
+    // After reading all tensor info, we're at the end of the tensor metadata
+    long tensor_info_end = ftell(f);
     fclose(f);
+
+    // Data section is aligned to 32 bytes (GGUF_DEFAULT_ALIGNMENT)
+    const uint32_t alignment = 32;
+    uint64_t data_section_offset = ((tensor_info_end + alignment - 1) / alignment) * alignment;
+
+    fprintf(stderr, "Tensor info ends at: %ld bytes\n", tensor_info_end);
+    fprintf(stderr, "Data section starts at: %llu bytes (aligned to %u bytes)\n",
+            data_section_offset, alignment);
+    fprintf(stderr, "Adding %llu bytes to all tensor offsets\n", data_section_offset);
 
     // Output CSV
     printf("tensor_name,file_offset,size_bytes,layer_id,component_type,n_dims,dim0,dim1,dim2,dim3\n");
@@ -304,17 +407,21 @@ int main(int argc, char** argv) {
         if (is_moe_expert_tensor(t.name.c_str(), t.n_dims)) {
             // Split into individual expert entries
             uint64_t n_experts = t.ne[2];  // Third dimension = number of experts
-            size_t element_size = (t.tensor_type == 1) ? 2 : 4;
-            uint64_t expert_size = t.ne[0] * t.ne[1] * element_size;  // Size of one expert slice
+
+            // Calculate size of one expert slice [dim0, dim1] using correct quantization
+            uint64_t expert_dims[2] = {t.ne[0], t.ne[1]};
+            uint64_t expert_size = calculate_tensor_size(t.tensor_type, 2, expert_dims);
 
             for (uint64_t exp_id = 0; exp_id < n_experts; exp_id++) {
-                uint64_t expert_offset = t.offset + (exp_id * expert_size);
+                // Calculate absolute offset (relative offset + data section offset)
+                uint64_t expert_relative_offset = t.offset + (exp_id * expert_size);
+                uint64_t expert_absolute_offset = data_section_offset + expert_relative_offset;
 
                 // Output format: tensor_name[expert_id]
                 printf("%s[%llu],%llu,%llu,%d,%s Expert %llu,%u,%llu,%llu,0,0\n",
                        t.name.c_str(),
                        exp_id,
-                       expert_offset,
+                       expert_absolute_offset,
                        expert_size,
                        t.layer_id,
                        t.component_type.c_str(),
@@ -324,10 +431,12 @@ int main(int argc, char** argv) {
                        t.ne[1]);
             }
         } else {
-            // Normal tensor - output as before
+            // Normal tensor - add data section offset to get absolute position
+            uint64_t absolute_offset = data_section_offset + t.offset;
+
             printf("%s,%llu,%llu,%d,%s,%u,%llu,%llu,%llu,%llu\n",
                    t.name.c_str(),
-                   t.offset,
+                   absolute_offset,
                    t.size_bytes,
                    t.layer_id,
                    t.component_type.c_str(),
