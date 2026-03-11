@@ -421,7 +421,8 @@ struct common_params {
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // use mmap for faster loads
-    bool use_mlock         = false; // use mlock to keep model in memory
+    bool use_mlock              = false; // use mlock to keep model in memory
+    bool pin_compute_weights    = false; // mlock attn+output weights (not embeddings/experts)
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading

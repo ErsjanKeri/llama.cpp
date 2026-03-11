@@ -2032,6 +2032,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MLOCK"));
     add_opt(common_arg(
+        {"--pin-compute-weights"},
+        "mlock attention and output projection weights (not embeddings or experts) to prevent eviction on SSD-backed inference",
+        [](common_params & params) {
+            params.pin_compute_weights = true;
+        }
+    ).set_env("LLAMA_ARG_PIN_COMPUTE_WEIGHTS"));
+    add_opt(common_arg(
         {"--mmap"},
         {"--no-mmap"},
         string_format("whether to memory-map model (if disabled, slower load but may reduce pageouts if not using mlock) (default: %s)", params.use_mmap ? "enabled" : "disabled"),

@@ -6952,6 +6952,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (params.pin_compute_weights) {
+        size_t locked = 0;
+        for (auto & [name, tensor] : tensors_by_name) {
+            if (name.find("_exps.") != std::string::npos) continue;
+            if (name == "token_embd.weight") continue;
+            if (!tensor->data) continue;
+            auto lk = std::make_unique<llama_mlock>();
+            lk->init(tensor->data);
+            lk->grow_to(ggml_nbytes(tensor));
+            pimpl->mlock_mmaps.emplace_back(std::move(lk));
+            locked += ggml_nbytes(tensor);
+        }
+        LLAMA_LOG_INFO("%s: pin_compute_weights: locked %.1f MiB\n", __func__, locked / 1048576.0);
+    }
+
 #ifdef GGML_TENSOR_TRACE
     // Store GGUF tensor offsets for tensor tracing (Phase 1.2)
     LLAMA_LOG_INFO("%s: storing GGUF offsets for tensor tracing...\n", __func__);
@@ -7928,6 +7943,7 @@ llama_model_params llama_model_default_params() {
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,
+        /*.pin_compute_weights         =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
