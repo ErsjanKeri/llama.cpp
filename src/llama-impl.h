@@ -49,6 +49,9 @@ struct time_meas {
     int64_t & t_acc;
 };
 
+// BSC thesis: read major page faults from /proc/self/stat (Linux only)
+int64_t llama_get_major_faults();
+
 void replace_all(std::string & s, const std::string & search, const std::string & replace);
 
 // TODO: rename to llama_format ?

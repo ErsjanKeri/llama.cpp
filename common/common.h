@@ -423,6 +423,7 @@ struct common_params {
     bool use_mmap          = true;  // use mmap for faster loads
     bool use_mlock              = false; // use mlock to keep model in memory
     bool pin_compute_weights    = false; // mlock attn+output weights (not embeddings/experts)
+    bool moe_prefetch           = false; // madvise(MADV_WILLNEED) expert weights after router selection
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading

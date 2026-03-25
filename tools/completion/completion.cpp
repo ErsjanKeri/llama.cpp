@@ -19,6 +19,29 @@
 #include <string>
 #include <vector>
 
+// BSC thesis: read major page faults from /proc/self/stat
+static int64_t bsc_get_major_faults() {
+#ifdef __linux__
+    FILE * f = fopen("/proc/self/stat", "r");
+    if (!f) return -1;
+    int pid;
+    char comm[256];
+    char state;
+    int ppid, pgrp, session, tty_nr, tpgid;
+    unsigned long flags, minflt, cminflt, majflt;
+    if (fscanf(f, "%d %255s %c %d %d %d %d %d %lu %lu %lu %lu",
+               &pid, comm, &state, &ppid, &pgrp, &session, &tty_nr, &tpgid,
+               &flags, &minflt, &cminflt, &majflt) == 12) {
+        fclose(f);
+        return (int64_t)majflt;
+    }
+    fclose(f);
+    return -1;
+#else
+    return -1;
+#endif
+}
+
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
 #include <unistd.h>
@@ -159,6 +182,12 @@ int main(int argc, char ** argv) {
 
     // note: the time for chat template initialization is not negligible:
     auto chat_templates = common_chat_templates_init(model, params.chat_template);
+
+    // print true model load time before the reset erases it
+    {
+        auto perf_pre_reset = llama_perf_context(ctx);
+        LOG_INF("[timing] true_model_load: %.2f ms (before perf reset)\n", perf_pre_reset.t_load_ms);
+    }
 
     // start measuring performance timings from here
     llama_perf_context_reset(ctx);
@@ -578,6 +607,8 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    bool bsc_prompt_done = false; // BSC: flag to capture T7 once
+
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
@@ -718,6 +749,12 @@ int main(int argc, char ** argv) {
         }
 
         embd.clear();
+
+        // BSC: capture T7 — first prompt eval done
+        if (!bsc_prompt_done && (int) embd_inp.size() <= n_consumed) {
+            llama_model_set_phase_ts(model, 7, ggml_time_us(), bsc_get_major_faults());
+            bsc_prompt_done = true;
+        }
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
             // optionally save the session on first sample (for faster prompt loading next time)
@@ -1012,8 +1049,14 @@ int main(int argc, char ** argv) {
         llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
     }
 
+    // BSC: capture T8 — generation done
+    llama_model_set_phase_ts(model, 8, ggml_time_us(), bsc_get_major_faults());
+
     LOG("\n\n");
     common_perf_print(ctx, smpl);
+
+    // BSC: print phase timing JSON
+    llama_model_print_phases(model);
 
     llama_backend_free();
 

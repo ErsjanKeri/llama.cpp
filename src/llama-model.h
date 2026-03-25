@@ -483,11 +483,37 @@ struct llama_model {
     std::unordered_map<std::string, uint16_t> tensor_file_indices;  // tensor_name → file index (for split models)
 #endif
 
+    // BSC thesis: madvise(MADV_WILLNEED) prefetch for MoE expert weights
+    bool moe_prefetch = false;
+
     // for keeping track of extra nodes used by lora adapters
     uint32_t n_lora_nodes = 0;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
+
+    // BSC thesis: independent phase timestamps (absolute ggml_time_us values)
+    // These are never affected by perf_reset() or synchronize()
+    struct phase_timestamps {
+        int64_t t0_model_start   = 0;  // start of llama_model_load()
+        int64_t t1_metadata_done = 0;  // after GGUF parse + vocab
+        int64_t t2_mmap_done     = 0;  // after init_mappings()
+        int64_t t3_tensors_done  = 0;  // after load_all_data()
+        int64_t t4_pinning_done  = 0;  // after pin_compute_weights() (0 if not pinning)
+        int64_t t5_context_ready = 0;  // after context construction
+        int64_t t6_warmup_done   = 0;  // after warmup (0 if --no-warmup)
+        int64_t t7_prompt_done   = 0;  // after first prompt eval
+        int64_t t8_generation_done = 0; // after last generated token
+        int64_t f0_faults = 0;  // major page faults at T0
+        int64_t f1_faults = 0;
+        int64_t f2_faults = 0;
+        int64_t f3_faults = 0;
+        int64_t f4_faults = 0;
+        int64_t f5_faults = 0;
+        int64_t f6_faults = 0;
+        int64_t f7_faults = 0;
+        int64_t f8_faults = 0;
+    } phases;
 
     explicit llama_model(const struct llama_model_params & params);
     ~llama_model();

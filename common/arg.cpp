@@ -2039,6 +2039,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIN_COMPUTE_WEIGHTS"));
     add_opt(common_arg(
+        {"--moe-prefetch"},
+        "use madvise(MADV_WILLNEED) to prefetch expert weights after router selection, before mul_mat_id accesses them",
+        [](common_params & params) {
+            params.moe_prefetch = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
+    add_opt(common_arg(
         {"--mmap"},
         {"--no-mmap"},
         string_format("whether to memory-map model (if disabled, slower load but may reduce pageouts if not using mlock) (default: %s)", params.use_mmap ? "enabled" : "disabled"),

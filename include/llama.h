@@ -311,6 +311,7 @@ extern "C" {
         bool use_mmap;        // use mmap if possible
         bool use_mlock;             // force system to keep model in RAM
         bool pin_compute_weights;   // mlock attention+output weights (not embeddings/experts)
+        bool moe_prefetch;          // madvise(MADV_WILLNEED) expert weights after router selection
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
@@ -1415,6 +1416,10 @@ extern "C" {
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
+
+    // BSC thesis: phase timing API (independent of perf_reset)
+    LLAMA_API void llama_model_set_phase_ts(struct llama_model * model, int phase, int64_t timestamp, int64_t faults);
+    LLAMA_API void llama_model_print_phases(const struct llama_model * model);
 
     // print a breakdown of per-device memory use via LLAMA_LOG:
     LLAMA_API void llama_memory_breakdown_print(const struct llama_context * ctx);

@@ -13,6 +13,67 @@
 #include <cmath>
 #include <cstring>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
+// BSC thesis: MoE expert weight prefetch via madvise(MADV_WILLNEED)
+// Inserted as a custom graph node between router selection and mul_mat_id.
+// Reads the selected expert IDs, then issues madvise for all 3 projections
+// (up, gate, down) in execution priority order.
+
+struct moe_prefetch_userdata {
+    const ggml_tensor * up_exps;
+    const ggml_tensor * gate_exps;   // may be nullptr
+    const ggml_tensor * down_exps;
+    int64_t n_expert;
+};
+
+static void moe_prefetch_callback(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * selected_experts,
+        int ith, int /*nth*/, void * userdata) {
+    // only thread 0 issues madvise
+    if (ith != 0) return;
+
+#ifdef __linux__
+    const auto * ud = (const moe_prefetch_userdata *) userdata;
+
+    const int n_ids    = selected_experts->ne[0]; // n_expert_used
+    const int n_tokens = selected_experts->ne[1];
+
+    // each expert tensor has shape [dim0, dim1, n_expert]
+    // stride along the expert dimension = nb[2] (bytes per expert slice)
+    const ggml_tensor * proj_tensors[] = { ud->up_exps, ud->gate_exps, ud->down_exps };
+
+    for (int p = 0; p < 3; p++) {
+        const ggml_tensor * proj = proj_tensors[p];
+        if (!proj || !proj->data) continue;
+
+        const size_t expert_stride = proj->nb[2]; // bytes per expert slice
+
+        for (int t = 0; t < n_tokens; t++) {
+            for (int i = 0; i < n_ids; i++) {
+                const int32_t expert_id = *(const int32_t *)
+                    ((const char *) selected_experts->data + t * selected_experts->nb[1] + i * selected_experts->nb[0]);
+
+                if (expert_id < 0 || expert_id >= ud->n_expert) continue;
+
+                void * addr = (char *) proj->data + expert_id * expert_stride;
+                posix_madvise(addr, expert_stride, POSIX_MADV_WILLNEED);
+            }
+        }
+    }
+#else
+    GGML_UNUSED(userdata);
+#endif
+
+    // pass through: copy selected_experts to dst unchanged
+    if (dst->data != selected_experts->data) {
+        memcpy(dst->data, selected_experts->data, ggml_nbytes(selected_experts));
+    }
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -647,6 +708,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     cb_func          (params.cb),
+    moe_prefetch     (params.moe_prefetch),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -1089,6 +1151,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
+    }
+
+    // BSC thesis: insert madvise prefetch node for expert weights
+    if (moe_prefetch) {
+        static moe_prefetch_userdata s_moe_prefetch_data[256];
+        GGML_ASSERT(il >= 0 && il < 256);
+
+        s_moe_prefetch_data[il] = {
+            /*.up_exps   =*/ up_exps,
+            /*.gate_exps =*/ gate_exps,
+            /*.down_exps =*/ down_exps,
+            /*.n_expert  =*/ n_expert,
+        };
+
+        // custom node: reads selected_experts, issues madvise, passes data through
+        selected_experts = ggml_map_custom1(ctx0, selected_experts,
+            moe_prefetch_callback, 1, &s_moe_prefetch_data[il]);
+        cb(selected_experts, "ffn_moe_prefetch", il);
     }
 
     ggml_tensor * up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]

@@ -8,6 +8,30 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+
+// BSC thesis: page fault helper for phase timing
+#ifdef __linux__
+#include <cstdio>
+static int64_t bsc_common_get_faults() {
+    FILE * f = fopen("/proc/self/stat", "r");
+    if (!f) return -1;
+    int pid;
+    char comm[256];
+    char state;
+    int ppid, pgrp, session, tty_nr, tpgid;
+    unsigned long flags, minflt, cminflt, majflt;
+    if (fscanf(f, "%d %255s %c %d %d %d %d %d %lu %lu %lu %lu",
+               &pid, comm, &state, &ppid, &pgrp, &session, &tty_nr, &tpgid,
+               &flags, &minflt, &cminflt, &majflt) == 12) {
+        fclose(f);
+        return (int64_t)majflt;
+    }
+    fclose(f);
+    return -1;
+}
+#else
+static int64_t bsc_common_get_faults() { return -1; }
+#endif
 #include "sampling.h"
 
 #include <algorithm>
@@ -1212,6 +1236,9 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         return res;
     }
 
+    // BSC: capture T5 — context ready
+    llama_model_set_phase_ts(model, 5, ggml_time_us(), bsc_common_get_faults());
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
@@ -1306,6 +1333,9 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         llama_set_warmup(lctx, false);
     }
 
+    // BSC: capture T6 — warmup done (or same as T5 if no warmup)
+    llama_model_set_phase_ts(model, 6, ggml_time_us(), bsc_common_get_faults());
+
     return res;
 }
 
@@ -1349,6 +1379,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_mmap        = params.use_mmap;
     mparams.use_mlock            = params.use_mlock;
     mparams.pin_compute_weights  = params.pin_compute_weights;
+    mparams.moe_prefetch         = params.moe_prefetch;
     mparams.check_tensors        = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;

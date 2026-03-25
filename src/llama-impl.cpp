@@ -6,6 +6,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <sstream>
@@ -23,6 +24,31 @@ time_meas::~time_meas() {
     if (t_start_us >= 0) {
         t_acc += ggml_time_us() - t_start_us;
     }
+}
+
+int64_t llama_get_major_faults() {
+#ifdef __linux__
+    FILE * f = fopen("/proc/self/stat", "r");
+    if (!f) return -1;
+    // field 12 (0-indexed) is majflt
+    // format: pid comm state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt ...
+    long long majflt = 0;
+    int pid;
+    char comm[256];
+    char state;
+    int ppid, pgrp, session, tty_nr, tpgid;
+    unsigned long flags, minflt, cminflt;
+    unsigned long majflt_ul;
+    if (fscanf(f, "%d %255s %c %d %d %d %d %d %lu %lu %lu %lu",
+               &pid, comm, &state, &ppid, &pgrp, &session, &tty_nr, &tpgid,
+               &flags, &minflt, &cminflt, &majflt_ul) == 12) {
+        majflt = (long long)majflt_ul;
+    }
+    fclose(f);
+    return (int64_t)majflt;
+#else
+    return -1;
+#endif
 }
 
 void llama_log_get(ggml_log_callback * log_callback, void ** user_data) {

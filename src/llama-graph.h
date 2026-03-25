@@ -431,6 +431,8 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    bool moe_prefetch;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -593,6 +595,8 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     const llm_graph_cb & cb_func;
+
+    const bool moe_prefetch;
 
     llm_graph_result * res;
 

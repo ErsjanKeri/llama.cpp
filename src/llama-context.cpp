@@ -1539,6 +1539,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.n_outputs   =*/ n_outputs,
+        /*.moe_prefetch=*/ model.moe_prefetch,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };

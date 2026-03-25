@@ -788,6 +788,10 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
 
     model.t_start_us = tm.t_start_us;
 
+    // BSC: capture T0
+    model.phases.t0_model_start = tm.t_start_us;
+    model.phases.f0_faults = llama_get_major_faults();
+
     try {
         llama_model_loader ml(fname, splits, params.use_mmap, params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
@@ -817,6 +821,10 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
 
         model.load_stats(ml);
         model.print_info();
+
+        // BSC: capture T1 — metadata + vocab done
+        model.phases.t1_metadata_done = ggml_time_us();
+        model.phases.f1_faults = llama_get_major_faults();
 
         if (params.vocab_only) {
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
@@ -1100,5 +1108,58 @@ const char * llama_print_system_info(void) {
     }
 
     return s.c_str();
+}
+
+//
+// BSC thesis: phase timing
+//
+
+void llama_model_set_phase_ts(llama_model * model, int phase, int64_t timestamp, int64_t faults) {
+    auto & p = model->phases;
+    switch (phase) {
+        case 0: p.t0_model_start   = timestamp; p.f0_faults = faults; break;
+        case 1: p.t1_metadata_done = timestamp; p.f1_faults = faults; break;
+        case 2: p.t2_mmap_done     = timestamp; p.f2_faults = faults; break;
+        case 3: p.t3_tensors_done  = timestamp; p.f3_faults = faults; break;
+        case 4: p.t4_pinning_done  = timestamp; p.f4_faults = faults; break;
+        case 5: p.t5_context_ready = timestamp; p.f5_faults = faults; break;
+        case 6: p.t6_warmup_done   = timestamp; p.f6_faults = faults; break;
+        case 7: p.t7_prompt_done   = timestamp; p.f7_faults = faults; break;
+        case 8: p.t8_generation_done = timestamp; p.f8_faults = faults; break;
+        default: break;
+    }
+}
+
+void llama_model_print_phases(const llama_model * model) {
+    const auto & p = model->phases;
+    const int64_t t0 = p.t0_model_start;
+
+    auto ms = [t0](int64_t t) -> double { return t > 0 ? (t - t0) / 1000.0 : 0.0; };
+    auto dur = [](int64_t a, int64_t b) -> double { return (a > 0 && b > 0) ? (b - a) / 1000.0 : 0.0; };
+    auto df = [](int64_t a, int64_t b) -> int64_t { return (a >= 0 && b >= 0) ? b - a : -1; };
+
+    LLAMA_LOG_INFO("\n[bsc_phases_json] {"
+        "\"t0_abs_us\": %" PRId64 ", "
+        "\"metadata_ms\": %.2f, \"metadata_faults\": %" PRId64 ", "
+        "\"mmap_ms\": %.2f, \"mmap_faults\": %" PRId64 ", "
+        "\"tensors_ms\": %.2f, \"tensors_faults\": %" PRId64 ", "
+        "\"pinning_ms\": %.2f, \"pinning_faults\": %" PRId64 ", "
+        "\"context_ms\": %.2f, \"context_faults\": %" PRId64 ", "
+        "\"warmup_ms\": %.2f, \"warmup_faults\": %" PRId64 ", "
+        "\"prompt_eval_ms\": %.2f, \"prompt_eval_faults\": %" PRId64 ", "
+        "\"generation_ms\": %.2f, \"generation_faults\": %" PRId64 ", "
+        "\"total_wall_ms\": %.2f, \"total_faults\": %" PRId64
+        "}\n",
+        t0,
+        dur(p.t0_model_start, p.t1_metadata_done), df(p.f0_faults, p.f1_faults),
+        dur(p.t1_metadata_done, p.t2_mmap_done),    df(p.f1_faults, p.f2_faults),
+        dur(p.t2_mmap_done, p.t3_tensors_done),      df(p.f2_faults, p.f3_faults),
+        dur(p.t3_tensors_done, p.t4_pinning_done),   df(p.f3_faults, p.f4_faults),
+        dur(p.t4_pinning_done, p.t5_context_ready),  df(p.f4_faults, p.f5_faults),
+        dur(p.t5_context_ready, p.t6_warmup_done),   df(p.f5_faults, p.f6_faults),
+        dur(p.t6_warmup_done, p.t7_prompt_done),      df(p.f6_faults, p.f7_faults),
+        dur(p.t7_prompt_done, p.t8_generation_done), df(p.f7_faults, p.f8_faults),
+        dur(p.t0_model_start, p.t8_generation_done), df(p.f0_faults, p.f8_faults)
+    );
 }
 

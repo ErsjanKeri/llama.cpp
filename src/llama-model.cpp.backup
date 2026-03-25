@@ -6794,11 +6794,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
-    ml.init_mappings(false, use_mlock ? &pimpl->mlock_mmaps : nullptr);
-
-    // BSC: capture T2 — mmap done
-    phases.t2_mmap_done = ggml_time_us();
-    phases.f2_faults = llama_get_major_faults();
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -6949,50 +6945,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
-    // BSC: capture T3 — tensors done
-    phases.t3_tensors_done = ggml_time_us();
-    phases.f3_faults = llama_get_major_faults();
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
-
-    if (params.pin_compute_weights) {
-        int64_t t_mlock_start = ggml_time_us();
-        size_t locked = 0;
-        size_t attempted = 0;
-        size_t failed_count = 0;
-        for (auto & [name, tensor] : tensors_by_name) {
-            if (name.find("_exps.") != std::string::npos) continue;
-            if (name == "token_embd.weight") continue;
-            if (!tensor->data) continue;
-            attempted++;
-            auto lk = std::make_unique<llama_mlock>();
-            lk->init(tensor->data);
-            lk->grow_to(ggml_nbytes(tensor));
-            if (lk->size() > 0) {
-                locked += ggml_nbytes(tensor);
-            } else {
-                failed_count++;
-            }
-            pimpl->mlock_mmaps.emplace_back(std::move(lk));
-        }
-        int64_t t_mlock_end = ggml_time_us();
-        LLAMA_LOG_INFO("%s: pin_compute_weights: attempted %zu tensors, locked %.1f MiB, failed %zu tensors, took %.2f ms\n",
-                       __func__, attempted, locked / 1048576.0, failed_count, (t_mlock_end - t_mlock_start) / 1000.0);
-    }
-
-    // BSC: store moe_prefetch flag for use during graph construction
-    moe_prefetch = params.moe_prefetch;
-    if (moe_prefetch) {
-        LLAMA_LOG_INFO("%s: moe_prefetch: enabled — will madvise(MADV_WILLNEED) expert weights after router selection\n", __func__);
-    }
-
-    // BSC: capture T4 — pinning done (or same as T3 if not pinning)
-    phases.t4_pinning_done = ggml_time_us();
-    phases.f4_faults = llama_get_major_faults();
 
 #ifdef GGML_TENSOR_TRACE
     // Store GGUF tensor offsets for tensor tracing (Phase 1.2)
@@ -7970,8 +7928,6 @@ llama_model_params llama_model_default_params() {
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,
-        /*.pin_compute_weights         =*/ false,
-        /*.moe_prefetch                =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
