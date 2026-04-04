@@ -74,6 +74,40 @@ static void moe_prefetch_callback(
     }
 }
 
+// BSC thesis: prefetch next layer's attention/output weights via madvise(MADV_WILLNEED)
+// Inserted before build_moe_ffn so the kernel can load next layer's weights
+// while the current layer's MoE expert computation is page-faulting.
+
+struct attn_prefetch_userdata {
+    const ggml_tensor * tensors[8];
+    int n_tensors;
+};
+
+static void attn_prefetch_callback(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * src,
+        int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) return;
+
+#ifdef __linux__
+    const auto * ud = (const attn_prefetch_userdata *) userdata;
+
+    for (int i = 0; i < ud->n_tensors; i++) {
+        const ggml_tensor * t = ud->tensors[i];
+        if (t && t->data) {
+            posix_madvise(t->data, ggml_nbytes(t), POSIX_MADV_WILLNEED);
+        }
+    }
+#else
+    GGML_UNUSED(userdata);
+#endif
+
+    // pass through: copy src to dst unchanged
+    if (dst->data != src->data) {
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+    }
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -709,6 +743,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     cb_func          (params.cb),
     moe_prefetch     (params.moe_prefetch),
+    prefetch_compute_weights(params.prefetch_compute_weights),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -957,6 +992,27 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(cur, "ffn_down_s", il);
     }
 
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_prefetch(
+        ggml_tensor * cur,
+        const ggml_tensor * const * tensors,
+        int n_tensors,
+        int il) const {
+    if (!prefetch_compute_weights) return cur;
+
+    static attn_prefetch_userdata s_attn_prefetch_data[256];
+    GGML_ASSERT(il >= 0 && il < 256);
+    GGML_ASSERT(n_tensors <= 8);
+
+    s_attn_prefetch_data[il].n_tensors = n_tensors;
+    for (int i = 0; i < n_tensors; i++) {
+        s_attn_prefetch_data[il].tensors[i] = tensors[i];
+    }
+
+    cur = ggml_map_custom1(ctx0, cur, attn_prefetch_callback, 1, &s_attn_prefetch_data[il]);
+    cb(cur, "attn_prefetch", il);
     return cur;
 }
 

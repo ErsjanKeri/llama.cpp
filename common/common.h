@@ -424,6 +424,8 @@ struct common_params {
     bool use_mlock              = false; // use mlock to keep model in memory
     bool pin_compute_weights    = false; // mlock attn+output weights (not embeddings/experts)
     bool moe_prefetch           = false; // madvise(MADV_WILLNEED) expert weights after router selection
+    bool madvise_random         = false; // madvise(MADV_RANDOM) on model mmap to disable speculative readahead
+    bool prefetch_compute_weights = false; // madvise(MADV_WILLNEED) next layer's attn+output weights during MoE
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading

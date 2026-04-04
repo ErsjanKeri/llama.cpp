@@ -312,6 +312,8 @@ extern "C" {
         bool use_mlock;             // force system to keep model in RAM
         bool pin_compute_weights;   // mlock attention+output weights (not embeddings/experts)
         bool moe_prefetch;          // madvise(MADV_WILLNEED) expert weights after router selection
+        bool madvise_random;        // madvise(MADV_RANDOM) on model mmap to disable speculative readahead
+        bool prefetch_compute_weights; // madvise(MADV_WILLNEED) next layer's attn+output weights during MoE
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used

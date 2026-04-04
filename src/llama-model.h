@@ -486,6 +486,9 @@ struct llama_model {
     // BSC thesis: madvise(MADV_WILLNEED) prefetch for MoE expert weights
     bool moe_prefetch = false;
 
+    // BSC thesis: madvise(MADV_WILLNEED) prefetch for next layer's attn+output weights during MoE
+    bool prefetch_compute_weights = false;
+
     // for keeping track of extra nodes used by lora adapters
     uint32_t n_lora_nodes = 0;
 

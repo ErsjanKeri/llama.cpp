@@ -2046,6 +2046,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH"));
     add_opt(common_arg(
+        {"--madvise-random"},
+        "use madvise(MADV_RANDOM) on model mmap to disable kernel speculative readahead on page faults",
+        [](common_params & params) {
+            params.madvise_random = true;
+        }
+    ).set_env("LLAMA_ARG_MADVISE_RANDOM"));
+    add_opt(common_arg(
+        {"--prefetch-compute-weights"},
+        "use madvise(MADV_WILLNEED) to prefetch next layer's attention+output weights during MoE computation",
+        [](common_params & params) {
+            params.prefetch_compute_weights = true;
+        }
+    ).set_env("LLAMA_ARG_PREFETCH_COMPUTE_WEIGHTS"));
+    add_opt(common_arg(
         {"--mmap"},
         {"--no-mmap"},
         string_format("whether to memory-map model (if disabled, slower load but may reduce pageouts if not using mlock) (default: %s)", params.use_mmap ? "enabled" : "disabled"),

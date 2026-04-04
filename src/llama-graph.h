@@ -432,6 +432,7 @@ struct llm_graph_params {
     uint32_t n_outputs;
 
     bool moe_prefetch;
+    bool prefetch_compute_weights;
 
     llm_graph_cb cb;
 
@@ -597,6 +598,7 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     const bool moe_prefetch;
+    const bool prefetch_compute_weights;
 
     llm_graph_result * res;
 
@@ -688,6 +690,13 @@ struct llm_graph_context {
             llama_expert_gating_func_type gating_op,
                      int   il,
              ggml_tensor * probs_in = nullptr) const;
+
+    // BSC thesis: prefetch next layer's attention/output weights via madvise(MADV_WILLNEED)
+    ggml_tensor * build_attn_prefetch(
+            ggml_tensor * cur,
+            const ggml_tensor * const * tensors,
+                     int   n_tensors,
+                     int   il) const;
 
     //
     // inputs

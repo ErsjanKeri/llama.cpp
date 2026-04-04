@@ -83,6 +83,25 @@ llm_build_openai_moe_iswa::llm_build_openai_moe_iswa(const llama_model & model, 
                 LLM_NORM_RMS, il);
         cb(cur, "attn_post_norm", il);
 
+        // BSC thesis: prefetch next layer's attention weights (or output weights for last layer)
+        // before MoE computation starts, giving the kernel time to load them asynchronously
+        if (il < n_layer - 1) {
+            const ggml_tensor * next_tensors[] = {
+                model.layers[il + 1].wq,
+                model.layers[il + 1].wk,
+                model.layers[il + 1].wv,
+                model.layers[il + 1].wo,
+                model.layers[il + 1].attn_norm,
+            };
+            cur = build_attn_prefetch(cur, next_tensors, 5, il);
+        } else {
+            const ggml_tensor * out_tensors[] = {
+                model.output_norm,
+                model.output,
+            };
+            cur = build_attn_prefetch(cur, out_tensors, 2, il);
+        }
+
         // MoE branch
         cur = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,  model.layers[il].ffn_gate_inp_b,

@@ -1540,6 +1540,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.n_outputs   =*/ n_outputs,
         /*.moe_prefetch=*/ model.moe_prefetch,
+        /*.prefetch_compute_weights=*/ model.prefetch_compute_weights,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
