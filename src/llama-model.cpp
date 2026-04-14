@@ -5,6 +5,51 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
+// BSC debug: print RSS breakdown from /proc/self/status at key lifecycle points.
+// This tells us EXACTLY what memory is physically resident (not virtual).
+#include <cstdio>
+#include <cstring>
+static void bsc_print_rss(const char * label) {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    fprintf(stderr, "\n[BSC_MEM] === %s ===\n", label);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0 ||
+            strncmp(line, "VmSize:", 7) == 0 ||
+            strncmp(line, "VmLck:",  6) == 0 ||
+            strncmp(line, "VmPin:",  6) == 0 ||
+            strncmp(line, "RssAnon:", 8) == 0 ||
+            strncmp(line, "RssFile:", 8) == 0) {
+            fprintf(stderr, "[BSC_MEM]   %s", line);
+        }
+    }
+    fclose(f);
+    f = fopen("/proc/self/cgroup", "r");
+    if (f) {
+        char cgpath[256] = {0};
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
+                char *p = line + 3;
+                char *nl = strchr(p, '\n');
+                if (nl) *nl = '\0';
+                snprintf(cgpath, sizeof(cgpath), "/sys/fs/cgroup%s/memory.current", p);
+                break;
+            }
+        }
+        fclose(f);
+        if (cgpath[0]) {
+            f = fopen(cgpath, "r");
+            if (f) {
+                long long mc = 0;
+                if (fscanf(f, "%lld", &mc) == 1)
+                    fprintf(stderr, "[BSC_MEM]   cgroup memory.current: %.1f MiB\n", mc/(1024.0*1024.0));
+                fclose(f);
+            }
+        }
+    }
+}
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
@@ -14,6 +59,13 @@
 #include "ggml-cpp.h"
 #ifdef GGML_TENSOR_TRACE
 #include "tensor_trace.h"
+#endif
+#ifdef __linux__
+#include "llama-io-uring.h"
+#include "llama-io-uring-buf.h"
+#include "bsc-expert-pack.h"
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 #include "models/models.h"
 
@@ -476,7 +528,18 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
-llama_model::~llama_model() = default;
+llama_model::~llama_model() {
+#ifdef __linux__
+    if (uring_ebuf) {
+        llama_uring_expert_buf_free(uring_ebuf);
+        uring_ebuf = nullptr;
+    }
+    if (uring_ctx) {
+        llama_io_uring_cleanup(uring_ctx);
+        uring_ctx = nullptr;
+    }
+#endif
+}
 
 void llama_model::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
@@ -6957,6 +7020,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // BSC: capture T3 — tensors done
     phases.t3_tensors_done = ggml_time_us();
     phases.f3_faults = llama_get_major_faults();
+    bsc_print_rss("after load_tensors (model mmap'd, before pin)");
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -6989,6 +7053,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                        __func__, attempted, locked / 1048576.0, failed_count, (t_mlock_end - t_mlock_start) / 1000.0);
     }
 
+    bsc_print_rss("after pin_compute_weights (mlock done)");
+
     // BSC: store moe_prefetch flag for use during graph construction
     moe_prefetch = params.moe_prefetch;
     if (moe_prefetch) {
@@ -7000,6 +7066,157 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     if (prefetch_compute_weights) {
         LLAMA_LOG_INFO("%s: prefetch_compute_weights: enabled — will madvise(MADV_WILLNEED) next layer's attn+output weights during MoE\n", __func__);
     }
+
+    // BSC: store uring_experts flag and initialize the io_uring engine +
+    // expert buffer manager from the .bscexp sidecar pack file. The pack
+    // file is REQUIRED — there is no fallback to the GGUF mmap path. Run
+    // tools/bsc-pack-experts to generate it once per model.
+    uring_experts      = params.uring_experts;
+    uring_overlap      = params.uring_overlap;
+    uring_cache_slots  = params.uring_cache_slots;
+    uring_cache_policy = params.uring_cache_policy;
+    uring_aging_mult   = params.uring_aging_mult;
+#ifdef __linux__
+    if (uring_experts && !layers.empty() && hparams.n_expert > 0) {
+        const int n_layer = (int)layers.size();
+
+        // 1. Build sidecar path: <model.gguf>.bscexp
+        const std::string pack_path = model_path + ".bscexp";
+        LLAMA_LOG_INFO("%s: uring_experts: opening pack file %s\n", __func__, pack_path.c_str());
+
+        // 2. Open the pack file with O_DIRECT via the io_uring engine.
+        uring_ctx = llama_io_uring_init(pack_path.c_str(), 64);
+        if (!uring_ctx) {
+            throw std::runtime_error(
+                "uring_experts: cannot open pack file '" + pack_path +
+                "'. Run tools/bsc-pack-experts on the GGUF first "
+                "(e.g. ./build/bin/llama-bsc-pack-experts <model.gguf> --verify).");
+        }
+
+        // 3. Read the pack-file header via a separate fd (the io_uring fd
+        //    is O_DIRECT and would force aligned reads). Header is small
+        //    enough to grab from a regular fd.
+        bsc_expert_pack_header pack_hdr{};
+        {
+            int hfd = ::open(pack_path.c_str(), O_RDONLY);
+            if (hfd < 0) {
+                llama_io_uring_cleanup(uring_ctx);
+                uring_ctx = nullptr;
+                throw std::runtime_error(
+                    "uring_experts: cannot open pack file for header read: " + pack_path);
+            }
+            ssize_t r = ::pread(hfd, &pack_hdr, sizeof(pack_hdr), 0);
+            ::close(hfd);
+            if (r != (ssize_t)sizeof(pack_hdr)) {
+                llama_io_uring_cleanup(uring_ctx);
+                uring_ctx = nullptr;
+                throw std::runtime_error(
+                    "uring_experts: failed to read pack file header from " + pack_path);
+            }
+        }
+
+        // 4. Validate the pack header against the format and the model.
+        if (memcmp(pack_hdr.magic, BSC_EXPERT_PACK_MAGIC, BSC_EXPERT_PACK_MAGIC_LEN) != 0) {
+            llama_io_uring_cleanup(uring_ctx);
+            uring_ctx = nullptr;
+            throw std::runtime_error(
+                "uring_experts: bad pack-file magic in " + pack_path +
+                " (expected '" BSC_EXPERT_PACK_MAGIC "')");
+        }
+        if (pack_hdr.header_size != BSC_EXPERT_PACK_HEADER_SIZE) {
+            llama_io_uring_cleanup(uring_ctx);
+            uring_ctx = nullptr;
+            throw std::runtime_error(
+                "uring_experts: pack-file header_size mismatch (expected "
+                + std::to_string(BSC_EXPERT_PACK_HEADER_SIZE) + ", got "
+                + std::to_string(pack_hdr.header_size) + ")");
+        }
+        if ((int)pack_hdr.n_layers != n_layer) {
+            llama_io_uring_cleanup(uring_ctx);
+            uring_ctx = nullptr;
+            throw std::runtime_error(
+                "uring_experts: pack-file n_layers=" + std::to_string(pack_hdr.n_layers) +
+                " does not match model n_layer=" + std::to_string(n_layer) +
+                " — pack file is for a different model");
+        }
+        if ((int)pack_hdr.n_expert != (int)hparams.n_expert) {
+            llama_io_uring_cleanup(uring_ctx);
+            uring_ctx = nullptr;
+            throw std::runtime_error(
+                "uring_experts: pack-file n_expert=" + std::to_string(pack_hdr.n_expert) +
+                " does not match model n_expert=" + std::to_string(hparams.n_expert));
+        }
+
+        // Determine the model's projection count (3 if has_gate, else 2).
+        const bool has_gate = (layers[0].ffn_gate_exps != nullptr);
+        const int  expected_n_proj = has_gate ? 3 : 2;
+        if ((int)pack_hdr.n_proj != expected_n_proj) {
+            llama_io_uring_cleanup(uring_ctx);
+            uring_ctx = nullptr;
+            throw std::runtime_error(
+                "uring_experts: pack-file n_proj=" + std::to_string(pack_hdr.n_proj) +
+                " does not match model expected n_proj=" + std::to_string(expected_n_proj) +
+                " (has_gate=" + (has_gate ? "true" : "false") + ")");
+        }
+
+        // Sanity-check expert_bytes against the actual loaded expert tensor.
+        // (nb[2] is the per-expert byte stride within the 3D tensor.)
+        const auto & l0 = layers[0];
+        const ggml_tensor * ref_t = l0.ffn_down_exps;
+        if (!ref_t) {
+            llama_io_uring_cleanup(uring_ctx);
+            uring_ctx = nullptr;
+            throw std::runtime_error(
+                "uring_experts: model has no ffn_down_exps tensor on layer 0");
+        }
+        if ((uint64_t)ref_t->nb[2] != pack_hdr.expert_bytes) {
+            llama_io_uring_cleanup(uring_ctx);
+            uring_ctx = nullptr;
+            throw std::runtime_error(
+                "uring_experts: pack-file expert_bytes=" + std::to_string(pack_hdr.expert_bytes) +
+                " does not match tensor nb[2]=" + std::to_string(ref_t->nb[2]) +
+                " — pack file is stale (regenerate with bsc-pack-experts)");
+        }
+        if ((pack_hdr.slot_bytes % BSC_EXPERT_PACK_ALIGN) != 0 ||
+            pack_hdr.slot_bytes < pack_hdr.expert_bytes) {
+            llama_io_uring_cleanup(uring_ctx);
+            uring_ctx = nullptr;
+            throw std::runtime_error(
+                "uring_experts: pack-file slot_bytes corrupted (slot_bytes=" +
+                std::to_string(pack_hdr.slot_bytes) + ", expert_bytes=" +
+                std::to_string(pack_hdr.expert_bytes) + ")");
+        }
+
+        // 5. Build the buffer-manager config from the pack header + cache slots flag.
+        llama_uring_expert_buf_config cfg{};
+        cfg.n_layers      = (int)pack_hdr.n_layers;
+        cfg.n_expert      = (int)pack_hdr.n_expert;
+        cfg.n_expert_used = (int)hparams.n_expert_used;
+        cfg.n_proj        = (int)pack_hdr.n_proj;
+        cfg.expert_bytes  = pack_hdr.expert_bytes;
+        cfg.slot_bytes    = pack_hdr.slot_bytes;
+        cfg.cache_slots   = uring_cache_slots;  // 0 = no caching (scratch pool only)
+        cfg.cache_policy  = uring_cache_policy;
+        cfg.aging_mult    = uring_aging_mult;
+
+        uring_ebuf = llama_uring_expert_buf_init(uring_ctx, &cfg);
+        if (!uring_ebuf) {
+            llama_io_uring_cleanup(uring_ctx);
+            uring_ctx = nullptr;
+            throw std::runtime_error(
+                "uring_experts: failed to initialize expert buffer manager");
+        }
+
+        LLAMA_LOG_INFO(
+            "%s: uring_experts: ready — %d layers, %d experts (%d used), "
+            "%d projections, slot_bytes=%lu (pad %lu), cache_slots=%d\n",
+            __func__, n_layer, (int)hparams.n_expert, (int)hparams.n_expert_used,
+            cfg.n_proj, (unsigned long)cfg.slot_bytes,
+            (unsigned long)(cfg.slot_bytes - cfg.expert_bytes),
+            cfg.cache_slots);
+    }
+    bsc_print_rss("after uring_expert_buf_init (cache buffer allocated via posix_memalign)");
+#endif
 
     // BSC: prefetch layer 0 attention weights at load time (no MoE to overlap with, but kernel can start readahead)
 #ifdef __linux__
@@ -8011,6 +8228,12 @@ llama_model_params llama_model_default_params() {
         /*.moe_prefetch                =*/ false,
         /*.madvise_random              =*/ false,
         /*.prefetch_compute_weights    =*/ false,
+        /*.uring_experts               =*/ false,
+        /*.uring_overlap               =*/ false,
+        /*.uring_cache_slots           =*/ 0,
+        /*.uring_cache_policy          =*/ 0,
+        /*.uring_aging_mult            =*/ 10,
+        /*.trace_mode                  =*/ 2,  // default: all
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,

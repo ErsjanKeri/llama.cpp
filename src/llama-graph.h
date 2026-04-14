@@ -433,6 +433,10 @@ struct llm_graph_params {
 
     bool moe_prefetch;
     bool prefetch_compute_weights;
+    bool uring_experts;
+    bool uring_overlap;
+
+    struct llama_uring_expert_buf * uring_ebuf;
 
     llm_graph_cb cb;
 
@@ -599,6 +603,10 @@ struct llm_graph_context {
 
     const bool moe_prefetch;
     const bool prefetch_compute_weights;
+    const bool uring_experts;
+    const bool uring_overlap;
+
+    struct llama_uring_expert_buf * uring_ebuf;
 
     llm_graph_result * res;
 

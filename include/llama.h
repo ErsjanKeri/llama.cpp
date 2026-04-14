@@ -314,6 +314,12 @@ extern "C" {
         bool moe_prefetch;          // madvise(MADV_WILLNEED) expert weights after router selection
         bool madvise_random;        // madvise(MADV_RANDOM) on model mmap to disable speculative readahead
         bool prefetch_compute_weights; // madvise(MADV_WILLNEED) next layer's attn+output weights during MoE
+        bool uring_experts;           // io_uring + O_DIRECT for expert weight loading
+        bool uring_overlap;           // overlap down-projection I/O with up+gate compute
+        int  uring_cache_slots;       // io_uring expert cache size (0 = no caching)
+        int  uring_cache_policy;      // 0 = LRU, 1 = LFU
+        int  uring_aging_mult;       // LFU-aging period = mult × cache_slots (default: 10)
+        int  trace_mode;              // 0=off, 1=experts only, 2=all
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
@@ -368,6 +374,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool eager_compute; // BSC: memset compute buffer at alloc to force all pages resident
     };
 
     // model quantization parameters

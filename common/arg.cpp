@@ -2039,6 +2039,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIN_COMPUTE_WEIGHTS"));
     add_opt(common_arg(
+        {"--eager-compute"},
+        "memset the compute buffer at allocation time to force all pages physically resident (deterministic memory usage)",
+        [](common_params & params) {
+            params.eager_compute = true;
+        }
+    ).set_env("LLAMA_ARG_EAGER_COMPUTE"));
+    add_opt(common_arg(
+        {"--trace-mode"}, "{off,experts,all}",
+        "tensor trace mode: off (no tracing), experts (MoE ops only), all (everything, default)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off")          params.trace_mode = 0;
+            else if (value == "experts") params.trace_mode = 1;
+            else if (value == "all")     params.trace_mode = 2;
+            else throw std::invalid_argument("invalid trace mode: " + value);
+        }
+    ).set_env("LLAMA_ARG_TRACE_MODE"));
+    add_opt(common_arg(
         {"--moe-prefetch"},
         "use madvise(MADV_WILLNEED) to prefetch expert weights after router selection, before mul_mat_id accesses them",
         [](common_params & params) {
@@ -2059,6 +2076,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.prefetch_compute_weights = true;
         }
     ).set_env("LLAMA_ARG_PREFETCH_COMPUTE_WEIGHTS"));
+    add_opt(common_arg(
+        {"--uring-experts"},
+        "use io_uring + O_DIRECT for expert weight loading into compact buffer (Linux only, bypasses page cache)",
+        [](common_params & params) {
+            params.uring_experts = true;
+        }
+    ).set_env("LLAMA_ARG_URING_EXPERTS"));
+    add_opt(common_arg(
+        {"--uring-overlap"},
+        "overlap down-projection io_uring reads with up+gate compute (requires --uring-experts)",
+        [](common_params & params) {
+            params.uring_overlap = true;
+        }
+    ).set_env("LLAMA_ARG_URING_OVERLAP"));
+    add_opt(common_arg(
+        {"--uring-cache-slots"}, "N",
+        "io_uring expert cache size in slots (0 = no caching). Each slot is one expert "
+        "weight slice (~4.4 MiB for GPT-OSS-20B). Requires --uring-experts.",
+        [](common_params & params, int value) {
+            params.uring_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_URING_CACHE_SLOTS"));
+    add_opt(common_arg(
+        {"--uring-cache-policy"}, "POLICY",
+        "io_uring expert cache eviction policy: 'lru' (default) or 'lfu'. Requires --uring-experts.",
+        [](common_params & params, const std::string & value) {
+            if (value == "lru" || value == "LRU") {
+                params.uring_cache_policy = 0;
+            } else if (value == "lfu" || value == "LFU") {
+                params.uring_cache_policy = 1;
+            } else if (value == "lfu-aging" || value == "LFU-AGING") {
+                params.uring_cache_policy = 2;
+            } else {
+                throw std::invalid_argument("--uring-cache-policy must be 'lru', 'lfu', or 'lfu-aging'");
+            }
+        }
+    ).set_env("LLAMA_ARG_URING_CACHE_POLICY"));
+    add_opt(common_arg(
+        {"--uring-aging-mult"}, "N",
+        "LFU-aging decay period multiplier: period = N × cache_slots (default: 10)",
+        [](common_params & params, int value) {
+            params.uring_aging_mult = value;
+        }
+    ).set_env("LLAMA_ARG_URING_AGING_MULT"));
     add_opt(common_arg(
         {"--mmap"},
         {"--no-mmap"},

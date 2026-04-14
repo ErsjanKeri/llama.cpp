@@ -3,6 +3,50 @@
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+
+// BSC debug: same RSS printer as in llama-model.cpp
+#include <cstdio>
+#include <cstring>
+static void bsc_print_rss(const char * label) {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    fprintf(stderr, "\n[BSC_MEM] === %s ===\n", label);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0 ||
+            strncmp(line, "VmSize:", 7) == 0 ||
+            strncmp(line, "VmLck:",  6) == 0 ||
+            strncmp(line, "VmPin:",  6) == 0 ||
+            strncmp(line, "RssAnon:", 8) == 0 ||
+            strncmp(line, "RssFile:", 8) == 0) {
+            fprintf(stderr, "[BSC_MEM]   %s", line);
+        }
+    }
+    fclose(f);
+    f = fopen("/proc/self/cgroup", "r");
+    if (f) {
+        char cgpath[256] = {0};
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
+                char *p = line + 3;
+                char *nl = strchr(p, '\n');
+                if (nl) *nl = '\0';
+                snprintf(cgpath, sizeof(cgpath), "/sys/fs/cgroup%s/memory.current", p);
+                break;
+            }
+        }
+        fclose(f);
+        if (cgpath[0]) {
+            f = fopen(cgpath, "r");
+            if (f) {
+                long long mc = 0;
+                if (fscanf(f, "%lld", &mc) == 1)
+                    fprintf(stderr, "[BSC_MEM]   cgroup memory.current: %.1f MiB\n", mc/(1024.0*1024.0));
+                fclose(f);
+            }
+        }
+    }
+}
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -250,6 +294,7 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        bsc_print_rss("after KV cache creation (memory.reset, includes memset(0))");
     }
 
     // init backends
@@ -442,6 +487,16 @@ llama_context::llama_context(
                         ggml_backend_buft_name(buft),
                         backend_buf_exp_size[i] / 1024.0 / 1024.0);
             }
+        }
+        bsc_print_rss("after graph_reserve (compute buffer allocated)");
+
+        // BSC: eager compute — force all compute buffer pages to be physically resident
+        // by memset'ing them. This makes memory usage deterministic regardless of workload
+        // (prompt size, batch size, etc.), which is critical for reproducible cgroup experiments.
+        if (params.eager_compute) {
+            ggml_backend_sched_clear_compute_buffers(sched.get(), 0);
+            LLAMA_LOG_INFO("%s: eager compute: cleared compute buffers to force page allocation\n", __func__);
+            bsc_print_rss("after eager compute (compute buffer pages committed)");
         }
 
         if (n_nodes_pp == n_nodes_tg) {
@@ -1350,6 +1405,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // BSC debug: probe RSS at a few decode iterations to see how much of the
+    // compute buffer / cache buffer / non-pinned model mmap actually faults in.
+    // Iterations chosen to cover: very first decode (compute buffer cold),
+    // 2nd (any one-shot init done), 5th (steady-state begins), and 50th
+    // (cache buffer should be fully populated by now for typical cache sizes).
+    {
+        static int bsc_decode_iter = 0;
+        bsc_decode_iter += 1;
+        if (bsc_decode_iter == 1 || bsc_decode_iter == 2 ||
+            bsc_decode_iter == 5 || bsc_decode_iter == 50 ||
+            bsc_decode_iter == 150) {
+            // ensure compute is done so RSS reflects what was actually touched
+            ggml_backend_sched_synchronize(sched.get());
+            char label[64];
+            snprintf(label, sizeof(label), "after decode iter %d", bsc_decode_iter);
+            bsc_print_rss(label);
+        }
+    }
+
     return 0;
 }
 
@@ -1541,6 +1615,9 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.moe_prefetch=*/ model.moe_prefetch,
         /*.prefetch_compute_weights=*/ model.prefetch_compute_weights,
+        /*.uring_experts=*/ model.uring_experts,
+        /*.uring_overlap=*/ model.uring_overlap,
+        /*.uring_ebuf  =*/ model.uring_ebuf,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -2414,6 +2491,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.eager_compute               =*/ false,
     };
 
     return result;

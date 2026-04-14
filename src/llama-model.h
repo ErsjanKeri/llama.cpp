@@ -16,6 +16,8 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_io_uring_context;
+struct llama_uring_expert_buf;
 
 // available models
 enum llm_type {
@@ -283,6 +285,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_b = nullptr;
     struct ggml_tensor * ffn_up_exps_b   = nullptr;
 
+    // ff MoE compact tensors for io_uring (shape [ne00, ne01, n_expert_used])
+    struct ggml_tensor * ffn_down_exps_compact = nullptr;
+    struct ggml_tensor * ffn_gate_exps_compact = nullptr;
+    struct ggml_tensor * ffn_up_exps_compact   = nullptr;
+
     // ff shared expert (shexp)
     struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
     struct ggml_tensor * ffn_gate_shexp     = nullptr;
@@ -488,6 +495,16 @@ struct llama_model {
 
     // BSC thesis: madvise(MADV_WILLNEED) prefetch for next layer's attn+output weights during MoE
     bool prefetch_compute_weights = false;
+
+    // BSC thesis: io_uring + O_DIRECT for expert weight loading
+    bool uring_experts = false;
+    bool uring_overlap = false;
+    int  uring_cache_slots = 0;            // 0 = no caching
+    int  uring_cache_policy = 0;           // 0 = LRU, 1 = LFU
+    int  uring_aging_mult = 10;            // LFU-aging period multiplier
+    std::string model_path;  // stored for io_uring O_DIRECT fd
+    struct llama_io_uring_context    * uring_ctx  = nullptr;
+    struct llama_uring_expert_buf    * uring_ebuf = nullptr;
 
     // for keeping track of extra nodes used by lora adapters
     uint32_t n_lora_nodes = 0;

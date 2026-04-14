@@ -710,9 +710,9 @@ int main(int argc, char ** argv) {
 #ifdef GGML_TENSOR_TRACE
             // Set tensor trace phase and token_id based on inference state
             if (n_consumed < (int) embd_inp.size()) {
-                // PROMPT phase: Still processing input tokens
+                // PROMPT phase: track actual prompt token index
                 tensor_trace_set_phase(TRACE_PHASE_PROMPT);
-                tensor_trace_set_token_id(0);
+                tensor_trace_set_token_id(n_consumed);
             } else {
                 // GENERATE phase: Generating new tokens
                 tensor_trace_set_phase(TRACE_PHASE_GENERATE);

@@ -1859,6 +1859,11 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
+void ggml_backend_sched_clear_compute_buffers(ggml_backend_sched_t sched, uint8_t value) {
+    GGML_ASSERT(sched);
+    ggml_gallocr_clear_all(sched->galloc, value);
+}
+
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

@@ -16,6 +16,10 @@
 #include "tensor_trace.h"
 #endif
 
+#ifdef __linux__
+#include "llama-io-uring-buf.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
@@ -787,6 +791,7 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     time_meas tm(model.t_load_us);
 
     model.t_start_us = tm.t_start_us;
+    model.model_path = fname;
 
     // BSC: capture T0
     model.phases.t0_model_start = tm.t_start_us;
@@ -980,8 +985,14 @@ static struct llama_model * llama_model_load_from_file_impl(
     }
     // TODO: initialising 2 Gb tensor trace buffer for now; make this configurable later
     #ifdef GGML_TENSOR_TRACE
-        tensor_trace_init("/tmp/tensor_trace.bin", 2ULL * 1024 * 1024 * 1024);
-        LLAMA_LOG_INFO("%s: tensor tracing initialized\n", __func__);
+        tensor_trace_set_mode((uint8_t)params.trace_mode);
+        if (params.trace_mode != 0) {
+            tensor_trace_init("/tmp/tensor_trace.bin", 2ULL * 1024 * 1024 * 1024);
+            const char * mode_str = params.trace_mode == 1 ? "experts" : "all";
+            LLAMA_LOG_INFO("%s: tensor tracing initialized (mode=%s)\n", __func__, mode_str);
+        } else {
+            LLAMA_LOG_INFO("%s: tensor tracing disabled\n", __func__);
+        }
     #endif
 
     return model;
@@ -1138,6 +1149,26 @@ void llama_model_print_phases(const llama_model * model) {
     auto dur = [](int64_t a, int64_t b) -> double { return (a > 0 && b > 0) ? (b - a) / 1000.0 : 0.0; };
     auto df = [](int64_t a, int64_t b) -> int64_t { return (a >= 0 && b >= 0) ? b - a : -1; };
 
+    // BSC: io_uring expert buffer metrics (only present when --uring-experts is active)
+    int64_t uring_loads = 0, uring_reads = 0, uring_bytes_disk = 0, uring_load_ns = 0;
+    int64_t uring_hits = 0, uring_misses = 0, uring_evictions = 0;
+    int     uring_cache_slots  = 0;
+    int     uring_cache_policy = 0;
+#ifdef __linux__
+    if (model->uring_ebuf) {
+        const auto m = llama_uring_expert_buf_get_metrics(model->uring_ebuf);
+        uring_loads      = m.loads;
+        uring_reads      = m.reads_submitted;
+        uring_bytes_disk = m.bytes_from_disk;
+        uring_load_ns    = m.load_time_ns;
+        uring_hits       = m.cache_hits;
+        uring_misses     = m.cache_misses;
+        uring_evictions  = m.cache_evictions;
+        uring_cache_slots  = model->uring_cache_slots;
+        uring_cache_policy = model->uring_cache_policy;
+    }
+#endif
+
     LLAMA_LOG_INFO("\n[bsc_phases_json] {"
         "\"t0_abs_us\": %" PRId64 ", "
         "\"metadata_ms\": %.2f, \"metadata_faults\": %" PRId64 ", "
@@ -1148,7 +1179,12 @@ void llama_model_print_phases(const llama_model * model) {
         "\"warmup_ms\": %.2f, \"warmup_faults\": %" PRId64 ", "
         "\"prompt_eval_ms\": %.2f, \"prompt_eval_faults\": %" PRId64 ", "
         "\"generation_ms\": %.2f, \"generation_faults\": %" PRId64 ", "
-        "\"total_wall_ms\": %.2f, \"total_faults\": %" PRId64
+        "\"total_wall_ms\": %.2f, \"total_faults\": %" PRId64 ", "
+        "\"uring_cache_slots\": %d, \"uring_cache_policy\": %d, "
+        "\"uring_loads\": %" PRId64 ", \"uring_reads\": %" PRId64 ", "
+        "\"uring_bytes_disk\": %" PRId64 ", \"uring_load_ms\": %.2f, "
+        "\"uring_cache_hits\": %" PRId64 ", \"uring_cache_misses\": %" PRId64 ", "
+        "\"uring_cache_evictions\": %" PRId64
         "}\n",
         t0,
         dur(p.t0_model_start, p.t1_metadata_done), df(p.f0_faults, p.f1_faults),
@@ -1159,7 +1195,10 @@ void llama_model_print_phases(const llama_model * model) {
         dur(p.t5_context_ready, p.t6_warmup_done),   df(p.f5_faults, p.f6_faults),
         dur(p.t6_warmup_done, p.t7_prompt_done),      df(p.f6_faults, p.f7_faults),
         dur(p.t7_prompt_done, p.t8_generation_done), df(p.f7_faults, p.f8_faults),
-        dur(p.t0_model_start, p.t8_generation_done), df(p.f0_faults, p.f8_faults)
+        dur(p.t0_model_start, p.t8_generation_done), df(p.f0_faults, p.f8_faults),
+        uring_cache_slots, uring_cache_policy,
+        uring_loads, uring_reads, uring_bytes_disk, uring_load_ns / 1e6,
+        uring_hits, uring_misses, uring_evictions
     );
 }
 

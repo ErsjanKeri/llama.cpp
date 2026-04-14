@@ -426,6 +426,13 @@ struct common_params {
     bool moe_prefetch           = false; // madvise(MADV_WILLNEED) expert weights after router selection
     bool madvise_random         = false; // madvise(MADV_RANDOM) on model mmap to disable speculative readahead
     bool prefetch_compute_weights = false; // madvise(MADV_WILLNEED) next layer's attn+output weights during MoE
+    bool eager_compute          = false; // memset compute buffer at alloc to force all pages resident
+    int  trace_mode             = 2;     // 0=off, 1=experts only, 2=all (default: all for backwards compat)
+    bool uring_experts          = false; // io_uring + O_DIRECT for expert weight loading (compact buffer)
+    bool uring_overlap          = false; // overlap down-projection I/O with up+gate compute
+    int  uring_cache_slots      = 0;     // size of the io_uring expert cache (0 = no caching)
+    int  uring_cache_policy     = 0;     // 0 = LRU, 1 = LFU (see llama_uring_cache_policy)
+    int  uring_aging_mult       = 10;    // LFU-aging period = aging_mult × cache_slots
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading

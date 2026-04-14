@@ -1118,6 +1118,16 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
 }
 
+void ggml_gallocr_clear_all(ggml_gallocr_t galloc, uint8_t value) {
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i]) {
+            for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS && galloc->buffers[i]->chunks[c]; c++) {
+                ggml_backend_buffer_clear(galloc->buffers[i]->chunks[c], value);
+            }
+        }
+    }
+}
+
 // utils
 
 static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buffers) {

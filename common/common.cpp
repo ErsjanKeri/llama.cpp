@@ -1382,6 +1382,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_prefetch         = params.moe_prefetch;
     mparams.madvise_random       = params.madvise_random;
     mparams.prefetch_compute_weights = params.prefetch_compute_weights;
+    mparams.trace_mode           = params.trace_mode;
+    mparams.uring_experts        = params.uring_experts;
+    mparams.uring_overlap        = params.uring_overlap;
+    mparams.uring_cache_slots    = params.uring_cache_slots;
+    mparams.uring_cache_policy   = params.uring_cache_policy;
+    mparams.uring_aging_mult     = params.uring_aging_mult;
     mparams.check_tensors        = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
@@ -1438,6 +1444,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+
+    cparams.eager_compute = params.eager_compute;
 
     return cparams;
 }

@@ -36,6 +36,7 @@ static __thread size_t g_thread_local_offset = 0;
 
 // Global execution context (Phase 1.1+)
 static int g_trace_enabled = 1;
+static uint8_t g_trace_mode = TRACE_MODE_ALL;  // default: trace everything
 static uint8_t g_current_phase = TRACE_PHASE_PROMPT;
 static uint32_t g_current_token_id = 0;
 
@@ -461,13 +462,20 @@ void tensor_trace_log_operation(
     const struct ggml_tensor * dst,
     int ith) {
 
-    if (!g_trace_enabled || dst == NULL) {
+    if (!g_trace_enabled || dst == NULL || g_trace_mode == TRACE_MODE_OFF) {
         return;
     }
 
     // Only first thread logs (avoid duplicate entries)
     if (ith != 0) {
         return;
+    }
+
+    // EXPERTS mode: only log MoE operations (MUL_MAT_ID, ADD_ID)
+    if (g_trace_mode == TRACE_MODE_EXPERTS) {
+        if (dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_ADD_ID) {
+            return;
+        }
     }
 
     // Create ONE trace entry for this operation
@@ -543,6 +551,11 @@ void tensor_trace_log_operation(
 
     // Log the single entry (contains operation + destination + all sources)
     tensor_trace_log(&entry);
+}
+
+// Set trace mode
+void tensor_trace_set_mode(uint8_t mode) {
+    g_trace_mode = mode;
 }
 
 // Set current phase (PROMPT or GENERATE)

@@ -16,6 +16,13 @@ enum TensorTracePhase {
     TRACE_PHASE_GENERATE = 1,
 };
 
+// Trace mode: controls which operations are logged
+enum TensorTraceMode {
+    TRACE_MODE_OFF     = 0,  // no tracing
+    TRACE_MODE_EXPERTS = 1,  // only MoE ops (MUL_MAT_ID, ADD_ID with expert_ids)
+    TRACE_MODE_ALL     = 2,  // all operations (original behavior)
+};
+
 // Memory source enumeration (disk-backed GGUF vs runtime buffers)
 enum MemorySource {
     MEMORY_SOURCE_DISK = 0,   // GGUF file (mmap'd model parameters)
@@ -179,6 +186,10 @@ struct ggml_tensor;
 void tensor_trace_log_operation(
     const struct ggml_tensor * dst,
     int ith);
+
+// Set trace mode (OFF, EXPERTS, ALL)
+// Called before tensor_trace_init or at any time to change filtering
+void tensor_trace_set_mode(uint8_t mode);
 
 // Set current inference phase (PROMPT or GENERATE)
 // Called from application code (e.g., llama-completion) to track phase

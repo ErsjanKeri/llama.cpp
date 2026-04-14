@@ -1625,7 +1625,23 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        // BSC thesis: indirect per-expert pointers via src0->extra.
+        // When src0->extra is non-NULL, treat it as an array of n_as void*
+        // pointers (one per expert in this tensor's expert dimension), and
+        // use the pointer for cur_a directly instead of computing
+        // src0->data + cur_a*nb02. This decouples expert slot placement
+        // from a constant stride, enabling the io_uring LRU cache to leave
+        // each expert's bytes wherever they were already loaded — no memcpy.
+        //
+        // Default behavior (extra == NULL) is unchanged for every other
+        // tensor in ggml; the branch is perfectly predictable.
+        const char * src0_cur;
+        if (src0->extra != NULL) {
+            const void * const * slot_ptrs = (const void * const *) src0->extra;
+            src0_cur = (const char *) slot_ptrs[cur_a];
+        } else {
+            src0_cur = (const char *) src0->data + cur_a * nb02;
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

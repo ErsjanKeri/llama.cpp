@@ -108,6 +108,165 @@ static void attn_prefetch_callback(
     }
 }
 
+// BSC thesis: io_uring expert loading callback
+// Reads selected_experts IDs, loads expert slices via io_uring + O_DIRECT into
+// the compact buffer, then writes remapped IDs [0,1,2,...] to output.
+// The compact tensors' data pointers are set to the loaded data.
+
+struct uring_expert_userdata {
+    struct llama_uring_expert_buf * ebuf;
+    int layer;
+    int n_expert_used;
+    // compact tensors to update data pointers on
+    struct ggml_tensor * compact_down;
+    struct ggml_tensor * compact_gate;  // may be nullptr
+    struct ggml_tensor * compact_up;
+};
+
+#ifdef __linux__
+#include "llama-io-uring-buf.h"
+#endif
+
+// Helper: read expert IDs from the selected_experts tensor.
+static void read_expert_ids(const struct ggml_tensor * selected_experts,
+                            int32_t * expert_ids, int n_ids) {
+    for (int i = 0; i < n_ids && i < LLAMA_URING_MAX_EXPERTS; i++) {
+        expert_ids[i] = *(const int32_t *)
+            ((const char *)selected_experts->data + i * selected_experts->nb[0]);
+    }
+}
+
+// Helper: write remapped IDs [0, 1, 2, ...] to the output tensor.
+static void write_remapped_ids(struct ggml_tensor * dst,
+                               const struct ggml_tensor * selected_experts) {
+    const int n_ids    = (int)selected_experts->ne[0];
+    const int n_tokens = (int)selected_experts->ne[1];
+    for (int t = 0; t < n_tokens; t++) {
+        for (int i = 0; i < n_ids; i++) {
+            *(int32_t *)((char *)dst->data + t * dst->nb[1] + i * dst->nb[0]) = i;
+        }
+    }
+}
+
+// Helper: wire compact tensor extra pointers for a range of projections.
+// p_start/p_end: projection index range to wire (e.g. [0,3) for all, [0,2) for up+gate, [2,3) for down).
+static void wire_extra_ptrs(const uring_expert_userdata * ud, int p_start, int p_end) {
+    // Projection ordering: 0=down, 1=gate (optional), 2=up
+    // Map projection index to compact tensor pointer.
+    struct ggml_tensor * proj_tensors[LLAMA_URING_MAX_PROJ] = {};
+    int n = 0;
+    if (ud->compact_down) proj_tensors[n++] = ud->compact_down;
+    if (ud->compact_gate) proj_tensors[n++] = ud->compact_gate;
+    if (ud->compact_up)   proj_tensors[n++] = ud->compact_up;
+
+    for (int p = p_start; p < p_end && p < n; p++) {
+        if (proj_tensors[p]) {
+            proj_tensors[p]->extra = const_cast<void *>(
+                (const void *) llama_uring_expert_buf_get_slot_ptrs(ud->ebuf, p));
+        }
+    }
+}
+
+// Original callback: load ALL projections synchronously, wire all extra ptrs.
+static void uring_expert_callback(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * selected_experts,
+        int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) return;
+
+#ifdef __linux__
+    const auto * ud = (const uring_expert_userdata *) userdata;
+    const int n_ids = (int)selected_experts->ne[0];
+
+    int32_t expert_ids[LLAMA_URING_MAX_EXPERTS];
+    read_expert_ids(selected_experts, expert_ids, n_ids);
+
+    int ret = llama_uring_expert_buf_load(ud->ebuf, ud->layer, expert_ids, n_ids);
+    if (ret < 0) {
+        fprintf(stderr, "uring_expert_callback: load failed for layer %d\n", ud->layer);
+    }
+
+    wire_extra_ptrs(ud, 0, LLAMA_URING_MAX_PROJ);
+    write_remapped_ids(dst, selected_experts);
+#else
+    GGML_UNUSED(userdata);
+    if (dst->data != selected_experts->data) {
+        memcpy(dst->data, selected_experts->data, ggml_nbytes(selected_experts));
+    }
+#endif
+}
+
+// Overlap callback 1: load up+gate (phase1 sync), submit down (phase2 async).
+// Wires up+gate extra ptrs. Down extra is NOT wired yet (data not loaded).
+static void uring_expert_overlap_phase1_callback(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * selected_experts,
+        int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) return;
+
+#ifdef __linux__
+    const auto * ud = (const uring_expert_userdata *) userdata;
+    const int n_ids = (int)selected_experts->ne[0];
+
+    int32_t expert_ids[LLAMA_URING_MAX_EXPERTS];
+    read_expert_ids(selected_experts, expert_ids, n_ids);
+
+    // Phase 1: load up+gate (bumps epoch, submits, waits)
+    int ret = llama_uring_expert_buf_load_phase1(ud->ebuf, ud->layer, expert_ids, n_ids);
+    if (ret < 0) {
+        fprintf(stderr, "uring_overlap_phase1: load failed for layer %d\n", ud->layer);
+    }
+
+    // Phase 2: submit down reads (same epoch, async — no wait)
+    ret = llama_uring_expert_buf_load_phase2_submit(ud->ebuf, ud->layer, expert_ids, n_ids);
+    if (ret < 0) {
+        fprintf(stderr, "uring_overlap_phase2_submit: failed for layer %d\n", ud->layer);
+    }
+
+    // Wire up+gate extra ptrs only (projection indices 1+ for gate/up).
+    // Projection order: 0=down, 1=gate, 2=up. Skip 0 (down), wire 1..n_proj-1.
+    wire_extra_ptrs(ud, 1, LLAMA_URING_MAX_PROJ);
+
+    write_remapped_ids(dst, selected_experts);
+#else
+    GGML_UNUSED(userdata);
+    if (dst->data != selected_experts->data) {
+        memcpy(dst->data, selected_experts->data, ggml_nbytes(selected_experts));
+    }
+#endif
+}
+
+// Overlap callback 2: wait for down reads (phase2_wait), wire down extra ptr.
+// Uses ggml_map_custom2 with (remapped_experts, act_result) as inputs.
+// Input a = remapped_experts (passthrough to dst).
+// Input b = act_result (dependency only — ensures this runs after swiglu).
+static void uring_expert_overlap_down_wait_callback(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * remapped_experts,
+        const struct ggml_tensor * /*act_result_dep*/,
+        int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) return;
+
+#ifdef __linux__
+    const auto * ud = (const uring_expert_userdata *) userdata;
+
+    // Wait for the async down reads submitted by phase1_callback
+    int ret = llama_uring_expert_buf_load_phase2_wait(ud->ebuf);
+    if (ret < 0) {
+        fprintf(stderr, "uring_overlap_down_wait: wait failed for layer %d\n", ud->layer);
+    }
+
+    // Wire down extra ptr (projection index 0)
+    wire_extra_ptrs(ud, 0, 1);
+
+    // Pass through remapped_experts → dst (same shape, tiny: 4 × n_tokens int32s)
+    memcpy(dst->data, remapped_experts->data, ggml_nbytes(remapped_experts));
+#else
+    GGML_UNUSED(userdata);
+    memcpy(dst->data, remapped_experts->data, ggml_nbytes(remapped_experts));
+#endif
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -744,6 +903,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     moe_prefetch     (params.moe_prefetch),
     prefetch_compute_weights(params.prefetch_compute_weights),
+    uring_experts    (params.uring_experts),
+    uring_overlap    (params.uring_overlap),
+    uring_ebuf       (params.uring_ebuf),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -1207,6 +1369,212 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
+    }
+
+    // BSC thesis: io_uring expert loading — replaces mmap page faults with O_DIRECT reads
+    // Only active for single-token generation (n_tokens == 1). For batch prompt eval,
+    // different tokens may select different experts, so we fall back to the mmap path.
+    if (uring_experts && uring_ebuf && n_tokens == 1) {
+        static uring_expert_userdata s_uring_data[256];
+        GGML_ASSERT(il >= 0 && il < 256);
+
+        // Find compact tensors by matching the original tensor in the same layer
+        // The compact tensors were created during model load and stored in the layer struct.
+        // We access them via the original tensors' names — they share the same layer index.
+        // For now, we use a simple convention: compact tensors are stored alongside
+        // the originals in the model's layer struct. We pass them via userdata.
+        //
+        // The caller (model-specific builder) passes the full expert tensors:
+        //   down_exps = model.layers[il].ffn_down_exps      (shape [.., .., 32])
+        //   gate_exps = model.layers[il].ffn_gate_exps      (may be nullptr)
+        //   up_exps   = model.layers[il].ffn_up_exps
+        // We need the compact versions. Since they're stored in the same layer struct,
+        // we look them up via the model reference in the graph params.
+
+        // Look up compact tensors from the view_src trick: we stored them in the layer
+        // at load time. Access via pointer arithmetic from the original tensor.
+        // Actually, the simplest: just set them from outside. The model builder knows them.
+        // For now: use the graph context's model reference.
+        // TODO: cleaner approach — pass compact tensors to build_moe_ffn directly
+
+        // We can't access model.layers here, so the compact tensors must be pre-registered
+        // in the static userdata by the model builder. As a bootstrap, we use a simpler
+        // approach: the io_uring callback will look up the data from uring_ebuf directly
+        // (the buffer manager knows which projection maps to which pointer).
+
+        s_uring_data[il] = {
+            /*.ebuf          =*/ uring_ebuf,
+            /*.layer         =*/ il,
+            /*.n_expert_used =*/ (int)n_expert_used,
+            /*.compact_down  =*/ nullptr,  // set below
+            /*.compact_gate  =*/ nullptr,
+            /*.compact_up    =*/ nullptr,
+        };
+
+        // The compact tensors are temporary [ne0, ne1, n_expert_used] views.
+        // We do NOT override nb[2] anymore: the patched mul_mat_id reads
+        // each expert through src0->extra (an array of n_expert_used void*
+        // pointers) and ignores nb[2] entirely when extra is non-null. The
+        // tensor's `data` field is also irrelevant for that path; ggml just
+        // wants a well-formed tensor object.
+        //
+        // The io_uring callback (uring_expert_callback, run as a graph node
+        // before these mul_mat_id ops) sets the `extra` field on each of
+        // these tensors right after it loads the slot pointers from the
+        // buffer manager.
+
+        // BSC thesis: create the "compact" tensor as a 3D VIEW of the original
+        // full-expert tensor instead of a fresh allocation. The view shares
+        // storage with `src` (no compute buffer space), but has the right
+        // shape (ne[2] = n_expert_used = 4) so the patched mul_mat_id reads
+        // the correct number of experts. The view's `data` pointer points
+        // into the model's mmap'd weight buffer, which we deliberately never
+        // dereference: our patched mul_mat_id reads expert weights through
+        // tensor->extra (the per-expert slot pointer array set by
+        // uring_expert_callback), not through tensor->data.
+        //
+        // Without this trick, ggml_new_tensor_3d would create 72 leaf
+        // tensors per layer pass (3 projections × 24 layers), each ~16.8 MiB,
+        // pinned in the compute buffer for the entire token-generation graph
+        // pass — adding ~797 MiB to the compute buffer reservation. With the
+        // view, the allocator skips them entirely (ggml-alloc.c:630
+        // explicitly bypasses views in ggml_gallocr_allocate_node), reducing
+        // the compute buffer for io_uring runs back to the same ~413 MiB
+        // that mmap+pin runs use.
+        //
+        // Pre-condition: src must have ggml_nbytes(src) >= n_expert_used worth
+        // of bytes, which is trivially true since src has ne[2]=n_expert > n_expert_used.
+        auto make_compact = [&](ggml_tensor * src, const char * name) -> ggml_tensor * {
+            ggml_tensor * t = ggml_view_3d(ctx0, src,
+                src->ne[0], src->ne[1], n_expert_used,
+                src->nb[1], src->nb[2], /*offset=*/0);
+            ggml_set_name(t, name);
+            return t;
+        };
+
+        ggml_tensor * compact_down = make_compact(down_exps, "ffn_moe_uring_down");
+        ggml_tensor * compact_gate = gate_exps ? make_compact(gate_exps, "ffn_moe_uring_gate") : nullptr;
+        ggml_tensor * compact_up   = make_compact(up_exps,   "ffn_moe_uring_up");
+
+        s_uring_data[il].compact_down = compact_down;
+        s_uring_data[il].compact_gate = compact_gate;
+        s_uring_data[il].compact_up   = compact_up;
+
+        // We need TWO ID tensors:
+        //   remapped_experts [0,1,2,3] — for mul_mat_id on compact weight tensors
+        //   selected_experts [9,2,11,5] — for add_id on full 32-expert bias tensors
+        // selected_experts is the input to the callback and stays alive as a graph node.
+        // The callback output (remapped_experts) is a NEW tensor with remapped values.
+        ggml_tensor * orig_selected = selected_experts;  // graph node, kept alive by ggml
+
+        // Choose callback: overlap (2-phase) or original (all-at-once)
+        ggml_tensor * remapped_experts;
+        if (uring_overlap) {
+            remapped_experts = ggml_map_custom1(ctx0, selected_experts,
+                uring_expert_overlap_phase1_callback, 1, &s_uring_data[il]);
+        } else {
+            remapped_experts = ggml_map_custom1(ctx0, selected_experts,
+                uring_expert_callback, 1, &s_uring_data[il]);
+        }
+        cb(remapped_experts, "ffn_moe_uring_load", il);
+
+        // Weight matmuls use compact tensors + remapped IDs
+        // Bias add_id uses full bias tensors + original IDs
+        ggml_tensor * up_result = ggml_mul_mat_id(ctx0, compact_up, cur, remapped_experts);
+        cb(up_result, "ffn_moe_up", il);
+
+        if (up_exps_b) {
+            up_result = ggml_add_id(ctx0, up_result, up_exps_b, orig_selected);
+            cb(up_result, "ffn_moe_up_biased", il);
+        }
+
+        ggml_tensor * gate_result = nullptr;
+        if (gate_exps) {
+            gate_result = ggml_mul_mat_id(ctx0, compact_gate, cur, remapped_experts);
+            cb(gate_result, "ffn_moe_gate", il);
+        }
+
+        if (gate_exps_b) {
+            gate_result = ggml_add_id(ctx0, gate_result, gate_exps_b, orig_selected);
+            cb(gate_result, "ffn_moe_gate_biased", il);
+        }
+
+        // Activation
+        ggml_tensor * act_result = gate_result ? gate_result : up_result;
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                if (gate_exps) {
+                    act_result = ggml_swiglu_split(ctx0, gate_result, up_result);
+                } else {
+                    act_result = ggml_silu(ctx0, up_result);
+                } break;
+            case LLM_FFN_GELU:
+                if (gate_exps) {
+                    act_result = ggml_geglu_split(ctx0, gate_result, up_result);
+                } else {
+                    act_result = ggml_gelu(ctx0, up_result);
+                } break;
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                {
+                    constexpr float alpha = 1.702f;
+                    constexpr float limit = 7.0f;
+                    act_result = ggml_swiglu_oai(ctx0, gate_result, up_result, alpha, limit);
+                } break;
+            case LLM_FFN_RELU:
+                if (gate_exps) {
+                    act_result = ggml_reglu_split(ctx0, gate_result, up_result);
+                } else {
+                    act_result = ggml_relu(ctx0, up_result);
+                } break;
+            default:
+                GGML_ABORT("unsupported activation in uring_experts path");
+        }
+        cb(act_result, "ffn_moe_act", il);
+
+        // Down projection — for overlap, insert a sync point between swiglu and down
+        // that waits for the async down reads and wires compact_down->extra.
+        ggml_tensor * down_ids = remapped_experts;
+        if (uring_overlap) {
+            // ggml_map_custom2(a=remapped_experts, b=act_result, ...) produces
+            // output shaped like a (tiny: 4 × n_tokens int32s). The dependency
+            // on b (act_result) ensures this runs AFTER swiglu completes, so
+            // the down reads have had maximum time to finish.
+            down_ids = ggml_map_custom2(ctx0, remapped_experts, act_result,
+                uring_expert_overlap_down_wait_callback, 1, &s_uring_data[il]);
+            cb(down_ids, "ffn_moe_uring_down_sync", il);
+        }
+
+        ggml_tensor * down_result = ggml_mul_mat_id(ctx0, compact_down, act_result, down_ids);
+        cb(down_result, "ffn_moe_down", il);
+
+        if (down_exps_b) {
+            down_result = ggml_add_id(ctx0, down_result, down_exps_b, orig_selected);
+            cb(down_result, "ffn_moe_down_biased", il);
+        }
+
+        if (!weight_before_ffn) {
+            down_result = ggml_mul(ctx0, down_result, weights);
+            cb(down_result, "ffn_moe_weighted", il);
+        }
+
+        // Aggregate expert outputs (same as original path)
+        ggml_tensor * cur_experts_u[LLAMA_MAX_EXPERTS] = { nullptr };
+        for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+            cur_experts_u[i] = ggml_view_2d(ctx0, down_result, n_embd, n_tokens,
+                                            down_result->nb[2], i * down_result->nb[1]);
+            ggml_build_forward_expand(gf, cur_experts_u[i]);
+        }
+
+        ggml_tensor * moe_out = cur_experts_u[0];
+        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+            moe_out = ggml_add(ctx0, moe_out, cur_experts_u[i]);
+        }
+        if (hparams.n_expert_used == 1) {
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
+        cb(moe_out, "ffn_moe_out", il);
+
+        return moe_out;
     }
 
     // BSC thesis: insert madvise prefetch node for expert weights
