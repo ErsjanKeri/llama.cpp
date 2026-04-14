@@ -293,6 +293,9 @@ struct moe_pipeline_fused_userdata {
     const struct ggml_tensor * up_exps_b;
     const struct ggml_tensor * gate_exps_b;
     const struct ggml_tensor * down_exps_b;
+    // Per-layer scratch + barrier. Lazy-allocated at graph build (single-threaded)
+    // the first time this layer is built; reused across decode passes.
+    struct moe_pipeline_shared * shared;
 };
 
 static void moe_pipeline_fused_callback(
@@ -300,9 +303,7 @@ static void moe_pipeline_fused_callback(
         const struct ggml_tensor * x_t,
         const struct ggml_tensor * selected_experts_t,
         const struct ggml_tensor * router_weights_t,
-        int ith, int /*nth*/, void * userdata) {
-    if (ith != 0) return;  // single-threaded first pass
-
+        int ith, int nth, void * userdata) {
     const auto * ud = (const moe_pipeline_fused_userdata *) userdata;
 
     llama_moe_fused_args args = {};
@@ -329,9 +330,12 @@ static void moe_pipeline_fused_callback(
     args.up_bias_type     = ud->up_exps_b   ? (int) ud->up_exps_b->type   : 0;
     args.gate_bias_type   = ud->gate_exps_b ? (int) ud->gate_exps_b->type : 0;
     args.down_bias_type   = ud->down_exps_b ? (int) ud->down_exps_b->type : 0;
+    args.ith              = ith;
+    args.nth              = nth;
+    args.shared           = ud->shared;
 
     int ret = llama_moe_pipeline_compute_fused(&args);
-    if (ret < 0) {
+    if (ret < 0 && ith == 0) {
         fprintf(stderr, "moe_pipeline_fused: compute failed for layer %d (ret=%d)\n", ud->layer, ret);
     }
 }
@@ -1524,9 +1528,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             pud.up_exps_b     = up_exps_b;
             pud.gate_exps_b   = gate_exps_b;
             pud.down_exps_b   = down_exps_b;
+            // Lazy allocate shared scratch + barrier the first time this layer
+            // is built. Subsequent builds reuse the same allocation.
+            if (pud.shared == nullptr) {
+                pud.shared = moe_pipeline_shared_alloc((int) n_embd, (int) up_exps->ne[1]);
+            }
 
+            // n_tasks = GGML_N_TASKS_MAX dispatches all available threads to the
+            // callback; matmul rows are split across them inside the op.
             ggml_tensor * fused_out = ggml_map_custom3(ctx0, cur, selected_experts, weights,
-                moe_pipeline_fused_callback, 1, &s_pipeline_data[il]);
+                moe_pipeline_fused_callback, GGML_N_TASKS_MAX, &s_pipeline_data[il]);
             cb(fused_out, "ffn_moe_pipeline", il);
             ggml_build_forward_expand(gf, fused_out);
 

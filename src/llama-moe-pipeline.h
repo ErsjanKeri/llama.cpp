@@ -69,16 +69,24 @@ int llama_moe_pipeline_phase2_wait(
 // --- Fused MoE FFN compute ---
 //
 // Single-token decode fused path. Submits all 12 io_uring reads, waits for
-// completion, then runs per-expert compute sequentially:
+// completion, then runs per-expert compute:
 //   up_e = W_up[e] · x      (+ bias)
 //   gate_e = W_gate[e] · x  (+ bias)
 //   act_e = swiglu_oai(gate_e, up_e, alpha, limit)
 //   down_e = W_down[e] · act_e  (+ bias)
 //   y += router_weights[e] * down_e
 //
-// Uses ggml's type-traits vec_dot primitives for bit-exact match with the
-// graph's mul_mat kernel. First implementation is single-threaded (ith==0);
-// subsequent commit adds multi-thread row-splitting for compute.
+// Multi-threaded: matmul/swiglu/accumulate work is row-split across ith/nth;
+// io_uring load and quantization are done by thread 0 only. Synchronisation
+// uses an internal sense-reversing barrier in the shared state.
+
+// Opaque per-layer shared state. Allocated once per layer at graph-build time
+// (single-threaded), reused across decode invocations. Contains scratch buffers
+// and barrier atomics used by the multi-threaded compute function.
+struct moe_pipeline_shared;
+
+struct moe_pipeline_shared * moe_pipeline_shared_alloc(int n_embd, int ffn_dim);
+void moe_pipeline_shared_free(struct moe_pipeline_shared * s);
 
 struct llama_moe_fused_args {
     // Output / inputs (host buffers, already materialized)
@@ -115,6 +123,11 @@ struct llama_moe_fused_args {
     int up_bias_type;
     int gate_bias_type;
     int down_bias_type;
+
+    // Threading (passed per-callback invocation).
+    int ith;
+    int nth;
+    struct moe_pipeline_shared * shared;  // scratch buffers + barrier; owned by userdata
 };
 
 int llama_moe_pipeline_compute_fused(const struct llama_moe_fused_args * args);
