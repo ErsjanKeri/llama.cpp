@@ -147,13 +147,17 @@ int llama_moe_pipeline_compute_fused(const struct llama_moe_fused_args * args) {
     const void * const * gate_slots = llama_uring_expert_buf_get_slot_ptrs(args->ebuf, 1);
     const void * const * up_slots   = llama_uring_expert_buf_get_slot_ptrs(args->ebuf, 2);
 
-    // Convert F32 activation x → vec_dot_type once per token (reused across all 12 matmuls).
+    // Weight traits (for vec_dot function) and activation-quant traits (for from_float).
+    // vec_dot expects the activation already converted to the weight's vec_dot_type;
+    // to produce that, we must use the vec_dot_type's from_float, NOT the weight type's.
     const ggml_type_traits_cpu * up_traits   = ggml_get_type_traits_cpu((ggml_type) args->W_up_type);
     const ggml_type_traits_cpu * gate_traits = ggml_get_type_traits_cpu((ggml_type) args->W_gate_type);
     const ggml_type_traits_cpu * down_traits = ggml_get_type_traits_cpu((ggml_type) args->W_down_type);
 
-    // For GPT-OSS-20B all three projections use the same weight type, but we support
-    // mismatched types by converting x independently per projection.
+    const ggml_type_traits_cpu * up_qtraits   = ggml_get_type_traits_cpu(up_traits->vec_dot_type);
+    const ggml_type_traits_cpu * gate_qtraits = ggml_get_type_traits_cpu(gate_traits->vec_dot_type);
+    const ggml_type_traits_cpu * down_qtraits = ggml_get_type_traits_cpu(down_traits->vec_dot_type);
+
     const size_t up_q_bytes   = ggml_row_size(up_traits->vec_dot_type, n_embd);
     const size_t gate_q_bytes = ggml_row_size(gate_traits->vec_dot_type, n_embd);
     const size_t down_q_bytes = ggml_row_size(down_traits->vec_dot_type, ffn_dim);
@@ -163,12 +167,12 @@ int llama_moe_pipeline_compute_fused(const struct llama_moe_fused_args * args) {
     // down's "x" is the swiglu activation (ffn_dim), converted inside the per-expert loop.
     std::vector<char> act_down_q(down_q_bytes);
 
-    up_traits->from_float(args->x_data, x_up_q.data(), n_embd);
+    up_qtraits->from_float(args->x_data, x_up_q.data(), n_embd);
     const void * x_gate_q_ptr = nullptr;
     if (up_traits->vec_dot_type == gate_traits->vec_dot_type) {
         x_gate_q_ptr = x_up_q.data();
     } else {
-        gate_traits->from_float(args->x_data, x_gate_q.data(), n_embd);
+        gate_qtraits->from_float(args->x_data, x_gate_q.data(), n_embd);
         x_gate_q_ptr = x_gate_q.data();
     }
 
@@ -207,8 +211,8 @@ int llama_moe_pipeline_compute_fused(const struct llama_moe_fused_args * args) {
         moe_swiglu_oai(act.data(), gate_out.data(), up_out.data(), ffn_dim,
                        args->swiglu_alpha, args->swiglu_limit);
 
-        // convert activation → down's vec_dot_type
-        down_traits->from_float(act.data(), act_down_q.data(), ffn_dim);
+        // convert activation → down's vec_dot_type (use vec_dot_type's from_float, not weight type's)
+        down_qtraits->from_float(act.data(), act_down_q.data(), ffn_dim);
 
         // down projection
         moe_matvec(down_out.data(), down_slots[e], act_down_q.data(), ffn_dim, n_embd, down_K_bytes, down_traits->vec_dot);

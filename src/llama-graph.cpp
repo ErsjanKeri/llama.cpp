@@ -1528,6 +1528,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * fused_out = ggml_map_custom3(ctx0, cur, selected_experts, weights,
                 moe_pipeline_fused_callback, 1, &s_pipeline_data[il]);
             cb(fused_out, "ffn_moe_pipeline", il);
+            ggml_build_forward_expand(gf, fused_out);
 
             ggml_tensor * moe_out = ggml_reshape_2d(ctx0, fused_out, n_embd, n_tokens);
             cb(moe_out, "ffn_moe_out", il);
