@@ -47,6 +47,25 @@ struct llama_moe_pipeline * llama_moe_pipeline_init(
 
 void llama_moe_pipeline_free(struct llama_moe_pipeline * pipeline);
 
+// --- Runtime ---
+//
+// Phase1: submit+wait for up+gate, submit down async (same epoch).
+// Phase2 wait: drain the down completions.
+//
+// Initial implementation delegates to the existing 2-phase API in
+// llama-io-uring-buf. Subsequent commits replace the internals with
+// per-expert async completion polling (all 12 reads submitted up-front,
+// compute advances per expert as its 3 weights arrive).
+
+int llama_moe_pipeline_phase1_load(
+        struct llama_uring_expert_buf * ebuf,
+        int                             layer,
+        const int32_t                 * expert_ids,
+        int                             n_ids);
+
+int llama_moe_pipeline_phase2_wait(
+        struct llama_uring_expert_buf * ebuf);
+
 #ifdef __cplusplus
 }
 #endif

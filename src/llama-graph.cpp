@@ -267,6 +267,68 @@ static void uring_expert_overlap_down_wait_callback(
 #endif
 }
 
+// Pipeline callbacks: route through llama-moe-pipeline.cpp. Initial stage
+// delegates to the same 2-phase API the overlap path uses, so output is
+// byte-identical. Subsequent commits replace the implementation in
+// llama-moe-pipeline.cpp with real per-expert async pipelining.
+#ifdef __linux__
+#include "llama-moe-pipeline.h"
+#endif
+
+static void uring_expert_pipeline_phase1_callback(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * selected_experts,
+        int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) return;
+
+#ifdef __linux__
+    const auto * ud = (const uring_expert_userdata *) userdata;
+    const int n_ids = (int)selected_experts->ne[0];
+
+    int32_t expert_ids[LLAMA_URING_MAX_EXPERTS];
+    read_expert_ids(selected_experts, expert_ids, n_ids);
+
+    int ret = llama_moe_pipeline_phase1_load(ud->ebuf, ud->layer, expert_ids, n_ids);
+    if (ret < 0) {
+        fprintf(stderr, "uring_pipeline_phase1: load failed for layer %d\n", ud->layer);
+    }
+
+    // Projection order: 0=down, 1=gate, 2=up. Wire gate+up; down waits for phase2.
+    wire_extra_ptrs(ud, 1, LLAMA_URING_MAX_PROJ);
+
+    write_remapped_ids(dst, selected_experts);
+#else
+    GGML_UNUSED(userdata);
+    if (dst->data != selected_experts->data) {
+        memcpy(dst->data, selected_experts->data, ggml_nbytes(selected_experts));
+    }
+#endif
+}
+
+static void uring_expert_pipeline_down_wait_callback(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * remapped_experts,
+        const struct ggml_tensor * /*act_result_dep*/,
+        int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) return;
+
+#ifdef __linux__
+    const auto * ud = (const uring_expert_userdata *) userdata;
+
+    int ret = llama_moe_pipeline_phase2_wait(ud->ebuf);
+    if (ret < 0) {
+        fprintf(stderr, "uring_pipeline_down_wait: wait failed for layer %d\n", ud->layer);
+    }
+
+    wire_extra_ptrs(ud, 0, 1);
+
+    memcpy(dst->data, remapped_experts->data, ggml_nbytes(remapped_experts));
+#else
+    GGML_UNUSED(userdata);
+    memcpy(dst->data, remapped_experts->data, ggml_nbytes(remapped_experts));
+#endif
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1468,10 +1530,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // The callback output (remapped_experts) is a NEW tensor with remapped values.
         ggml_tensor * orig_selected = selected_experts;  // graph node, kept alive by ggml
 
-        // Choose callback: overlap (2-phase) or pipeline (per-expert, initially cloned
-        // from overlap) or original (all-at-once)
+        // Choose callback: pipeline (per-expert, via llama-moe-pipeline), overlap
+        // (2-phase), or original (all-at-once). Pipeline and overlap are mutually
+        // exclusive; flag validation happens at argv-parse time.
         ggml_tensor * remapped_experts;
-        if (uring_overlap || uring_pipeline) {
+        if (uring_pipeline) {
+            remapped_experts = ggml_map_custom1(ctx0, selected_experts,
+                uring_expert_pipeline_phase1_callback, 1, &s_uring_data[il]);
+        } else if (uring_overlap) {
             remapped_experts = ggml_map_custom1(ctx0, selected_experts,
                 uring_expert_overlap_phase1_callback, 1, &s_uring_data[il]);
         } else {
@@ -1536,7 +1602,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // Down projection — for overlap, insert a sync point between swiglu and down
         // that waits for the async down reads and wires compact_down->extra.
         ggml_tensor * down_ids = remapped_experts;
-        if (uring_overlap || uring_pipeline) {
+        if (uring_pipeline) {
+            down_ids = ggml_map_custom2(ctx0, remapped_experts, act_result,
+                uring_expert_pipeline_down_wait_callback, 1, &s_uring_data[il]);
+            cb(down_ids, "ffn_moe_uring_down_sync", il);
+        } else if (uring_overlap) {
             // ggml_map_custom2(a=remapped_experts, b=act_result, ...) produces
             // output shaped like a (tiny: 4 × n_tokens int32s). The dependency
             // on b (act_result) ensures this runs AFTER swiglu completes, so

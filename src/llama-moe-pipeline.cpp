@@ -37,4 +37,27 @@ void llama_moe_pipeline_free(struct llama_moe_pipeline * pipeline) {
     free(pipeline);
 }
 
+// --- Runtime wrappers ---
+//
+// Initial implementation: delegate to the existing 2-phase API. This makes the
+// --uring-pipeline path byte-identical to --uring-overlap but routed through
+// this module, so subsequent commits can replace the internals with real
+// per-expert async pipelining without touching the graph builder.
+
+int llama_moe_pipeline_phase1_load(
+        struct llama_uring_expert_buf * ebuf,
+        int                             layer,
+        const int32_t                 * expert_ids,
+        int                             n_ids) {
+    int ret = llama_uring_expert_buf_load_phase1(ebuf, layer, expert_ids, n_ids);
+    if (ret < 0) {
+        return ret;
+    }
+    return llama_uring_expert_buf_load_phase2_submit(ebuf, layer, expert_ids, n_ids);
+}
+
+int llama_moe_pipeline_phase2_wait(struct llama_uring_expert_buf * ebuf) {
+    return llama_uring_expert_buf_load_phase2_wait(ebuf);
+}
+
 #endif // __linux__
