@@ -273,6 +273,68 @@ static void uring_expert_overlap_down_wait_callback(
 // llama-moe-pipeline.cpp with real per-expert async pipelining.
 #ifdef __linux__
 #include "llama-moe-pipeline.h"
+
+// Userdata for the fused MoE FFN op. Captures everything the callback needs
+// at graph-execution time (tensor data pointers, dims, activation params).
+struct moe_pipeline_fused_userdata {
+    struct llama_uring_expert_buf * ebuf;
+    int layer;
+    int n_expert;
+    int n_expert_used;
+    int n_embd;
+    int ffn_dim;
+    int W_up_type;
+    int W_gate_type;
+    int W_down_type;
+    int has_swiglu_oai;
+    float swiglu_alpha;
+    float swiglu_limit;
+    // Bias tensors (nullable). Data pointers resolved at callback time.
+    const struct ggml_tensor * up_exps_b;
+    const struct ggml_tensor * gate_exps_b;
+    const struct ggml_tensor * down_exps_b;
+};
+
+static void moe_pipeline_fused_callback(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * x_t,
+        const struct ggml_tensor * selected_experts_t,
+        const struct ggml_tensor * router_weights_t,
+        int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) return;  // single-threaded first pass
+
+    const auto * ud = (const moe_pipeline_fused_userdata *) userdata;
+
+    llama_moe_fused_args args = {};
+    args.dst_data         = (float *) dst->data;
+    args.x_data           = (const float *) x_t->data;
+    args.selected_experts = (const int32_t *) selected_experts_t->data;
+    args.router_weights   = (const float *) router_weights_t->data;
+    args.ebuf             = ud->ebuf;
+    args.layer            = ud->layer;
+    args.n_expert_used    = ud->n_expert_used;
+    args.n_tokens         = 1;
+    args.n_embd           = ud->n_embd;
+    args.ffn_dim          = ud->ffn_dim;
+    args.n_expert         = ud->n_expert;
+    args.W_up_type        = ud->W_up_type;
+    args.W_gate_type      = ud->W_gate_type;
+    args.W_down_type      = ud->W_down_type;
+    args.swiglu_alpha     = ud->swiglu_alpha;
+    args.swiglu_limit     = ud->swiglu_limit;
+    args.has_swiglu_oai   = ud->has_swiglu_oai;
+    args.up_bias_data     = ud->up_exps_b   ? ud->up_exps_b->data   : nullptr;
+    args.gate_bias_data   = ud->gate_exps_b ? ud->gate_exps_b->data : nullptr;
+    args.down_bias_data   = ud->down_exps_b ? ud->down_exps_b->data : nullptr;
+    args.up_bias_type     = ud->up_exps_b   ? (int) ud->up_exps_b->type   : 0;
+    args.gate_bias_type   = ud->gate_exps_b ? (int) ud->gate_exps_b->type : 0;
+    args.down_bias_type   = ud->down_exps_b ? (int) ud->down_exps_b->type : 0;
+
+    int ret = llama_moe_pipeline_compute_fused(&args);
+    if (ret < 0) {
+        fprintf(stderr, "moe_pipeline_fused: compute failed for layer %d (ret=%d)\n", ud->layer, ret);
+    }
+}
 #endif
 
 static void uring_expert_pipeline_phase1_callback(
@@ -1438,6 +1500,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Only active for single-token generation (n_tokens == 1). For batch prompt eval,
     // different tokens may select different experts, so we fall back to the mmap path.
     if (uring_experts && uring_ebuf && n_tokens == 1) {
+#ifdef __linux__
+        // --- --uring-pipeline path: single fused custom op replacing the whole
+        //     up/gate/swiglu/down/accumulate sequence. Currently single-threaded
+        //     and sequential per expert (no async pipelining yet).
+        if (uring_pipeline) {
+            static moe_pipeline_fused_userdata s_pipeline_data[256];
+            GGML_ASSERT(il >= 0 && il < 256);
+
+            auto & pud = s_pipeline_data[il];
+            pud.ebuf          = uring_ebuf;
+            pud.layer         = il;
+            pud.n_expert      = (int) n_expert;
+            pud.n_expert_used = (int) n_expert_used;
+            pud.n_embd        = (int) n_embd;
+            pud.ffn_dim       = (int) up_exps->ne[1];
+            pud.W_up_type     = (int) up_exps->type;
+            pud.W_gate_type   = gate_exps ? (int) gate_exps->type : (int) up_exps->type;
+            pud.W_down_type   = (int) down_exps->type;
+            pud.has_swiglu_oai = (type_op == LLM_FFN_SWIGLU_OAI_MOE) ? 1 : 0;
+            pud.swiglu_alpha  = 1.702f;
+            pud.swiglu_limit  = 7.0f;
+            pud.up_exps_b     = up_exps_b;
+            pud.gate_exps_b   = gate_exps_b;
+            pud.down_exps_b   = down_exps_b;
+
+            ggml_tensor * fused_out = ggml_map_custom3(ctx0, cur, selected_experts, weights,
+                moe_pipeline_fused_callback, 1, &s_pipeline_data[il]);
+            cb(fused_out, "ffn_moe_pipeline", il);
+
+            ggml_tensor * moe_out = ggml_reshape_2d(ctx0, fused_out, n_embd, n_tokens);
+            cb(moe_out, "ffn_moe_out", il);
+            return moe_out;
+        }
+#endif
+
         static uring_expert_userdata s_uring_data[256];
         GGML_ASSERT(il >= 0 && il < 256);
 

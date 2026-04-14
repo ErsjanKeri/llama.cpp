@@ -66,6 +66,59 @@ int llama_moe_pipeline_phase1_load(
 int llama_moe_pipeline_phase2_wait(
         struct llama_uring_expert_buf * ebuf);
 
+// --- Fused MoE FFN compute ---
+//
+// Single-token decode fused path. Submits all 12 io_uring reads, waits for
+// completion, then runs per-expert compute sequentially:
+//   up_e = W_up[e] · x      (+ bias)
+//   gate_e = W_gate[e] · x  (+ bias)
+//   act_e = swiglu_oai(gate_e, up_e, alpha, limit)
+//   down_e = W_down[e] · act_e  (+ bias)
+//   y += router_weights[e] * down_e
+//
+// Uses ggml's type-traits vec_dot primitives for bit-exact match with the
+// graph's mul_mat kernel. First implementation is single-threaded (ith==0);
+// subsequent commit adds multi-thread row-splitting for compute.
+
+struct llama_moe_fused_args {
+    // Output / inputs (host buffers, already materialized)
+    float        * dst_data;              // [n_embd, n_tokens]
+    const float  * x_data;                // [n_embd, n_tokens]
+    const int32_t* selected_experts;      // [n_expert_used, n_tokens]
+    const float  * router_weights;        // [1, n_expert_used, n_tokens]
+
+    // Expert buffer manager for io_uring loads
+    struct llama_uring_expert_buf * ebuf;
+    int layer;
+
+    // Dimensions
+    int n_expert_used;
+    int n_tokens;
+    int n_embd;
+    int ffn_dim;
+    int n_expert;   // total experts per layer (for bias indexing)
+
+    // Expert weight types (per projection) — drives vec_dot selection
+    int W_up_type;     // enum ggml_type
+    int W_gate_type;
+    int W_down_type;
+
+    // Swiglu-OAI parameters (set when activation is SWIGLU_OAI_MOE)
+    float swiglu_alpha;
+    float swiglu_limit;
+    int   has_swiglu_oai;  // 1 for GPT-OSS, 0 otherwise
+
+    // Biases (nullable). Shape: [ffn_dim, n_expert] for up/gate; [n_embd, n_expert] for down.
+    const void * up_bias_data;
+    const void * gate_bias_data;
+    const void * down_bias_data;
+    int up_bias_type;
+    int gate_bias_type;
+    int down_bias_type;
+};
+
+int llama_moe_pipeline_compute_fused(const struct llama_moe_fused_args * args);
+
 #ifdef __cplusplus
 }
 #endif
