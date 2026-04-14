@@ -1468,9 +1468,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // The callback output (remapped_experts) is a NEW tensor with remapped values.
         ggml_tensor * orig_selected = selected_experts;  // graph node, kept alive by ggml
 
-        // Choose callback: overlap (2-phase) or original (all-at-once)
+        // Choose callback: overlap (2-phase) or pipeline (per-expert, initially cloned
+        // from overlap) or original (all-at-once)
         ggml_tensor * remapped_experts;
-        if (uring_overlap) {
+        if (uring_overlap || uring_pipeline) {
             remapped_experts = ggml_map_custom1(ctx0, selected_experts,
                 uring_expert_overlap_phase1_callback, 1, &s_uring_data[il]);
         } else {
@@ -1535,7 +1536,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // Down projection — for overlap, insert a sync point between swiglu and down
         // that waits for the async down reads and wires compact_down->extra.
         ggml_tensor * down_ids = remapped_experts;
-        if (uring_overlap) {
+        if (uring_overlap || uring_pipeline) {
             // ggml_map_custom2(a=remapped_experts, b=act_result, ...) produces
             // output shaped like a (tiny: 4 × n_tokens int32s). The dependency
             // on b (act_result) ensures this runs AFTER swiglu completes, so
