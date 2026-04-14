@@ -43,8 +43,14 @@ struct moe_pipeline_shared {
 
     // Quantised activation buffers (Q8_0 layout — large enough for any model
     // we care about since Q8_0 is the common vec_dot_type for F16/MXFP4/Q4_*).
-    char  * x_q;          // len = ggml_row_size(Q8_0, n_embd)
-    char  * act_q;        // len = ggml_row_size(Q8_0, ffn_dim)
+    char  * x_q;           // len = ggml_row_size(Q8_0, n_embd)
+    // Per-expert quantised swiglu activation. Stored because up+gate+swiglu
+    // for all experts runs BEFORE any down matmul so that phase2 io_uring
+    // reads can overlap with the up+gate+swiglu compute — this reclaims the
+    // I/O-compute overlap that the existing --uring-overlap path gets.
+    char  * act_q_per_expert;  // len = n_expert_used * ggml_row_size(Q8_0, ffn_dim)
+    size_t  act_q_row_bytes;   // ggml_row_size(Q8_0, ffn_dim) — stride within act_q_per_expert
+    int     n_expert_used;
 
     // pthread barrier — reusable across every stage and every op invocation
     // (pthread_barrier_wait handles the reset automatically). Initialised with
@@ -59,16 +65,16 @@ struct moe_pipeline_shared {
     int ffn_dim;
 };
 
-struct moe_pipeline_shared * moe_pipeline_shared_alloc(int n_embd, int ffn_dim) {
+struct moe_pipeline_shared * moe_pipeline_shared_alloc(int n_embd, int ffn_dim, int n_expert_used) {
     auto * s = new moe_pipeline_shared();
     s->up_out   = (float *) malloc((size_t) ffn_dim * sizeof(float));
     s->gate_out = (float *) malloc((size_t) ffn_dim * sizeof(float));
     s->act      = (float *) malloc((size_t) ffn_dim * sizeof(float));
     s->down_out = (float *) malloc((size_t) n_embd  * sizeof(float));
-    // Q8_0 row size = (n/32) * 34. Use the exact ggml helper so the layout
-    // matches what vec_dot_*_q8_0 expects.
     s->x_q   = (char *) malloc(ggml_row_size(GGML_TYPE_Q8_0, n_embd));
-    s->act_q = (char *) malloc(ggml_row_size(GGML_TYPE_Q8_0, ffn_dim));
+    s->act_q_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, ffn_dim);
+    s->act_q_per_expert = (char *) malloc((size_t) n_expert_used * s->act_q_row_bytes);
+    s->n_expert_used = n_expert_used;
     s->barrier_nth = 0;
     pthread_mutex_init(&s->init_mutex, nullptr);
     s->n_embd = n_embd;
@@ -83,7 +89,7 @@ void moe_pipeline_shared_free(struct moe_pipeline_shared * s) {
     free(s->act);
     free(s->down_out);
     free(s->x_q);
-    free(s->act_q);
+    free(s->act_q_per_expert);
     if (s->barrier_nth > 0) {
         pthread_barrier_destroy(&s->barrier);
     }
@@ -233,13 +239,26 @@ int llama_moe_pipeline_compute_fused(const struct llama_moe_fused_args * args) {
     const ggml_type_traits_cpu * up_qtraits   = ggml_get_type_traits_cpu(up_traits->vec_dot_type);
     const ggml_type_traits_cpu * down_qtraits = ggml_get_type_traits_cpu(down_traits->vec_dot_type);
 
+    // Assumption for the shared x_q buffer: up and gate use the same vec_dot_type
+    // (true for GPT-OSS, where both are MXFP4 → Q8_0). If a future model breaks
+    // this, add a separate x_gate_q buffer in shared state.
+    if (up_traits->vec_dot_type != gate_traits->vec_dot_type) {
+        if (ith == 0) {
+            fprintf(stderr, "moe-pipeline: up/gate vec_dot_type mismatch not supported\n");
+        }
+        return -1;
+    }
+
     const size_t up_K_bytes   = ggml_row_size((ggml_type) args->W_up_type, n_embd);
     const size_t gate_K_bytes = ggml_row_size((ggml_type) args->W_gate_type, n_embd);
     const size_t down_K_bytes = ggml_row_size((ggml_type) args->W_down_type, ffn_dim);
 
-    // --- Stage 1: thread 0 submits io_uring loads and quantises x. ---
-    // For now, assume up and gate share the same vec_dot_type (true for GPT-OSS).
-    // If they differ, we'd need a second x_q buffer — add later if a model needs it.
+    // =============================================================================
+    // Stage 1: kick off all I/O, quantise x, zero the output.
+    //   - phase1: synchronous load of up+gate (8 slots)
+    //   - phase2_submit: async load of down (4 slots) — keeps running during
+    //     the up+gate+swiglu compute that follows.
+    // =============================================================================
     if (ith == 0) {
         int32_t expert_ids[LLAMA_URING_MAX_EXPERTS];
         for (int e = 0; e < n_expert_used; e++) {
@@ -247,75 +266,103 @@ int llama_moe_pipeline_compute_fused(const struct llama_moe_fused_args * args) {
         }
         int r1 = llama_uring_expert_buf_load_phase1(args->ebuf, args->layer, expert_ids, n_expert_used);
         int r2 = (r1 == 0) ? llama_uring_expert_buf_load_phase2_submit(args->ebuf, args->layer, expert_ids, n_expert_used) : r1;
-        int r3 = (r2 == 0) ? llama_uring_expert_buf_load_phase2_wait(args->ebuf) : r2;
-        if (r3 < 0) {
-            fprintf(stderr, "moe-pipeline: io_uring load failed for layer %d\n", args->layer);
+        if (r2 < 0) {
+            fprintf(stderr, "moe-pipeline: phase1/phase2_submit failed for layer %d\n", args->layer);
         }
         up_qtraits->from_float(args->x_data, sh->x_q, n_embd);
         memset(args->dst_data, 0, sizeof(float) * n_embd);
     }
     moe_barrier(sh, nth);
 
-    // Slot pointers become valid after phase2_wait completes — read after the
-    // barrier so all threads see the same post-load pointers.
-    const void * const * down_slots = llama_uring_expert_buf_get_slot_ptrs(args->ebuf, 0);
+    // up and gate slot pointers are valid after phase1 (sync). down slots will
+    // be valid only after phase2_wait — read them after the stage-3 barrier.
     const void * const * gate_slots = llama_uring_expert_buf_get_slot_ptrs(args->ebuf, 1);
     const void * const * up_slots   = llama_uring_expert_buf_get_slot_ptrs(args->ebuf, 2);
 
-    // Per-expert loop. Each stage within the expert is row-split across threads
-    // and followed by a barrier so dependent stages see a consistent buffer.
+    // =============================================================================
+    // Stage 2: up + gate + swiglu for every expert, using thread-local row slices.
+    //   The down-projection io_uring reads submitted in stage 1 continue in
+    //   parallel with this compute. Each expert's swiglu result is quantised to
+    //   Q8_0 into a per-expert slot in `act_q_per_expert` so stage 4 can replay
+    //   them in any order.
+    //
+    //   All operations within one expert's iteration read/write only the
+    //   calling thread's [i0, i1) slice, so NO barrier is needed between
+    //   up/gate/swiglu. Only one barrier per expert is required before thread 0
+    //   quantises `act` (which reads the full range).
+    // =============================================================================
     for (int e = 0; e < n_expert_used; e++) {
         const int32_t eid = args->selected_experts[e];
+        int i0, i1;
+        moe_row_range(ffn_dim, ith, nth, &i0, &i1);
 
-        // up projection (rows split across threads). Bias add runs on the same
-        // [i0, i1) range so each thread only touches its own rows — avoids a
-        // cross-thread read before the barrier.
-        {
-            int i0, i1;
-            moe_row_range(ffn_dim, ith, nth, &i0, &i1);
-            moe_matvec_range(sh->up_out, up_slots[e], sh->x_q,
-                             n_embd, i0, i1, up_K_bytes, up_traits->vec_dot);
-            if (args->up_bias_data) {
-                const float * up_b = (const float *) args->up_bias_data + (size_t) eid * ffn_dim;
-                for (int k = i0; k < i1; k++) sh->up_out[k] += up_b[k];
-            }
+        // up projection
+        moe_matvec_range(sh->up_out, up_slots[e], sh->x_q,
+                         n_embd, i0, i1, up_K_bytes, up_traits->vec_dot);
+        if (args->up_bias_data) {
+            const float * up_b = (const float *) args->up_bias_data + (size_t) eid * ffn_dim;
+            for (int k = i0; k < i1; k++) sh->up_out[k] += up_b[k];
         }
+
+        // gate projection
+        moe_matvec_range(sh->gate_out, gate_slots[e], sh->x_q,
+                         n_embd, i0, i1, gate_K_bytes, gate_traits->vec_dot);
+        if (args->gate_bias_data) {
+            const float * gate_b = (const float *) args->gate_bias_data + (size_t) eid * ffn_dim;
+            for (int k = i0; k < i1; k++) sh->gate_out[k] += gate_b[k];
+        }
+
+        // swiglu_oai (same i0..i1 slice — up_out[k] and gate_out[k] were both
+        // written above by this same thread, so no cross-thread read).
+        moe_swiglu_oai_range(sh->act, sh->gate_out, sh->up_out, i0, i1,
+                             args->swiglu_alpha, args->swiglu_limit);
+
+        // Sync before thread 0 reads the full `act` for quantisation.
         moe_barrier(sh, nth);
 
-        // gate projection (same thread-local slice pattern)
-        {
-            int i0, i1;
-            moe_row_range(ffn_dim, ith, nth, &i0, &i1);
-            moe_matvec_range(sh->gate_out, gate_slots[e], sh->x_q,
-                             n_embd, i0, i1, gate_K_bytes, gate_traits->vec_dot);
-            if (args->gate_bias_data) {
-                const float * gate_b = (const float *) args->gate_bias_data + (size_t) eid * ffn_dim;
-                for (int k = i0; k < i1; k++) sh->gate_out[k] += gate_b[k];
-            }
-        }
-        moe_barrier(sh, nth);
-
-        // swiglu_oai — split elements across threads (reads up_out, gate_out).
-        {
-            int k0, k1;
-            moe_row_range(ffn_dim, ith, nth, &k0, &k1);
-            moe_swiglu_oai_range(sh->act, sh->gate_out, sh->up_out, k0, k1,
-                                 args->swiglu_alpha, args->swiglu_limit);
-        }
-        moe_barrier(sh, nth);
-
-        // Quantise activation → down's vec_dot_type (thread 0 only; from_float
-        // APIs typically aren't parallel-safe on a single buffer).
         if (ith == 0) {
-            down_qtraits->from_float(sh->act, sh->act_q, ffn_dim);
+            char * act_q_e = sh->act_q_per_expert + (size_t) e * sh->act_q_row_bytes;
+            down_qtraits->from_float(sh->act, act_q_e, ffn_dim);
         }
-        moe_barrier(sh, nth);
+        // No barrier here — the next expert's up/gate/swiglu reads x_q and
+        // up_slots[e+1] only, not act or act_q. Thread 0's quantise will be
+        // visible via the stage-3 barrier before stage 4 reads act_q_per_expert.
+    }
 
-        // down projection + bias + weighted accumulate — same thread-local slice.
-        {
-            int i0, i1;
-            moe_row_range(n_embd, ith, nth, &i0, &i1);
-            moe_matvec_range(sh->down_out, down_slots[e], sh->act_q,
+    // =============================================================================
+    // Stage 3: wait for phase2 (down-projection) reads to complete.
+    //   By now stage 2's ~(n_expert_used × (2 matmuls + swiglu + quantise)) of
+    //   compute has elapsed, during which the NVMe completed the 4 down reads.
+    //   phase2_wait is the final sync; on any remaining tail it blocks here.
+    // =============================================================================
+    if (ith == 0) {
+        int r = llama_uring_expert_buf_load_phase2_wait(args->ebuf);
+        if (r < 0) {
+            fprintf(stderr, "moe-pipeline: phase2_wait failed for layer %d\n", args->layer);
+        }
+    }
+    moe_barrier(sh, nth);
+
+    const void * const * down_slots = llama_uring_expert_buf_get_slot_ptrs(args->ebuf, 0);
+
+    // =============================================================================
+    // Stage 4: down matmul + bias + router-weighted accumulation for every expert.
+    //   Everything here is thread-local — each thread owns rows [i0, i1) of the
+    //   n_embd output. dst_data is written only by the thread that owns that row,
+    //   both for the zero-init in stage 1 (thread 0 full) and for the per-expert
+    //   accumulate here (own slice). No barriers needed within the loop.
+    //
+    //   The implicit ggml_barrier after the custom op returns provides the
+    //   cross-thread visibility the next graph node (residual add) needs.
+    // =============================================================================
+    {
+        int i0, i1;
+        moe_row_range(n_embd, ith, nth, &i0, &i1);
+        for (int e = 0; e < n_expert_used; e++) {
+            const int32_t eid = args->selected_experts[e];
+            const char * act_q_e = sh->act_q_per_expert + (size_t) e * sh->act_q_row_bytes;
+
+            moe_matvec_range(sh->down_out, down_slots[e], act_q_e,
                              ffn_dim, i0, i1, down_K_bytes, down_traits->vec_dot);
             if (args->down_bias_data) {
                 const float * down_b = (const float *) args->down_bias_data + (size_t) eid * n_embd;
@@ -324,7 +371,6 @@ int llama_moe_pipeline_compute_fused(const struct llama_moe_fused_args * args) {
             const float w = args->router_weights[e];
             for (int k = i0; k < i1; k++) args->dst_data[k] += w * sh->down_out[k];
         }
-        moe_barrier(sh, nth);
     }
 
     return 0;

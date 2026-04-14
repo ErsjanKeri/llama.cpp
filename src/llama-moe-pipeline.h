@@ -85,7 +85,7 @@ int llama_moe_pipeline_phase2_wait(
 // and barrier atomics used by the multi-threaded compute function.
 struct moe_pipeline_shared;
 
-struct moe_pipeline_shared * moe_pipeline_shared_alloc(int n_embd, int ffn_dim);
+struct moe_pipeline_shared * moe_pipeline_shared_alloc(int n_embd, int ffn_dim, int n_expert_used);
 void moe_pipeline_shared_free(struct moe_pipeline_shared * s);
 
 struct llama_moe_fused_args {

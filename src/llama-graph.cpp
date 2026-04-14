@@ -1531,7 +1531,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // Lazy allocate shared scratch + barrier the first time this layer
             // is built. Subsequent builds reuse the same allocation.
             if (pud.shared == nullptr) {
-                pud.shared = moe_pipeline_shared_alloc((int) n_embd, (int) up_exps->ne[1]);
+                pud.shared = moe_pipeline_shared_alloc((int) n_embd, (int) up_exps->ne[1], (int) n_expert_used);
             }
 
             // n_tasks = GGML_N_TASKS_MAX dispatches all available threads to the
