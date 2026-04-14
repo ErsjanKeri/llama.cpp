@@ -28,6 +28,7 @@ add_library(llama
             llama-mmap.cpp
             llama-io-uring.cpp
             llama-io-uring-buf.cpp
+            llama-moe-pipeline.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
