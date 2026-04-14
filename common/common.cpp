@@ -1385,6 +1385,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.trace_mode           = params.trace_mode;
     mparams.uring_experts        = params.uring_experts;
     mparams.uring_overlap        = params.uring_overlap;
+    mparams.uring_pipeline       = params.uring_pipeline;
     mparams.uring_cache_slots    = params.uring_cache_slots;
     mparams.uring_cache_policy   = params.uring_cache_policy;
     mparams.uring_aging_mult     = params.uring_aging_mult;

@@ -2085,11 +2085,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_URING_EXPERTS"));
     add_opt(common_arg(
         {"--uring-overlap"},
-        "overlap down-projection io_uring reads with up+gate compute (requires --uring-experts)",
+        "overlap down-projection io_uring reads with up+gate compute (requires --uring-experts; mutually exclusive with --uring-pipeline)",
         [](common_params & params) {
+            if (params.uring_pipeline) {
+                throw std::invalid_argument("--uring-overlap is mutually exclusive with --uring-pipeline");
+            }
             params.uring_overlap = true;
         }
     ).set_env("LLAMA_ARG_URING_OVERLAP"));
+    add_opt(common_arg(
+        {"--uring-pipeline"},
+        "per-expert async pipelining: fused MoE FFN op advances each expert as its weights arrive "
+        "(requires --uring-experts; mutually exclusive with --uring-overlap)",
+        [](common_params & params) {
+            if (params.uring_overlap) {
+                throw std::invalid_argument("--uring-pipeline is mutually exclusive with --uring-overlap");
+            }
+            params.uring_pipeline = true;
+        }
+    ).set_env("LLAMA_ARG_URING_PIPELINE"));
     add_opt(common_arg(
         {"--uring-cache-slots"}, "N",
         "io_uring expert cache size in slots (0 = no caching). Each slot is one expert "

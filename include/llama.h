@@ -316,6 +316,7 @@ extern "C" {
         bool prefetch_compute_weights; // madvise(MADV_WILLNEED) next layer's attn+output weights during MoE
         bool uring_experts;           // io_uring + O_DIRECT for expert weight loading
         bool uring_overlap;           // overlap down-projection I/O with up+gate compute
+        bool uring_pipeline;          // per-expert async pipelining (fused MoE FFN op)
         int  uring_cache_slots;       // io_uring expert cache size (0 = no caching)
         int  uring_cache_policy;      // 0 = LRU, 1 = LFU
         int  uring_aging_mult;       // LFU-aging period = mult × cache_slots (default: 10)

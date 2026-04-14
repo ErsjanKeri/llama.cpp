@@ -435,6 +435,7 @@ struct llm_graph_params {
     bool prefetch_compute_weights;
     bool uring_experts;
     bool uring_overlap;
+    bool uring_pipeline;
 
     struct llama_uring_expert_buf * uring_ebuf;
 
@@ -605,6 +606,7 @@ struct llm_graph_context {
     const bool prefetch_compute_weights;
     const bool uring_experts;
     const bool uring_overlap;
+    const bool uring_pipeline;
 
     struct llama_uring_expert_buf * uring_ebuf;
 

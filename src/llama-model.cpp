@@ -7073,6 +7073,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // tools/bsc-pack-experts to generate it once per model.
     uring_experts      = params.uring_experts;
     uring_overlap      = params.uring_overlap;
+    uring_pipeline     = params.uring_pipeline;
     uring_cache_slots  = params.uring_cache_slots;
     uring_cache_policy = params.uring_cache_policy;
     uring_aging_mult   = params.uring_aging_mult;
@@ -8230,6 +8231,7 @@ llama_model_params llama_model_default_params() {
         /*.prefetch_compute_weights    =*/ false,
         /*.uring_experts               =*/ false,
         /*.uring_overlap               =*/ false,
+        /*.uring_pipeline              =*/ false,
         /*.uring_cache_slots           =*/ 0,
         /*.uring_cache_policy          =*/ 0,
         /*.uring_aging_mult            =*/ 10,

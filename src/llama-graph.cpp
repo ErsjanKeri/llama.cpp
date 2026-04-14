@@ -905,6 +905,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     prefetch_compute_weights(params.prefetch_compute_weights),
     uring_experts    (params.uring_experts),
     uring_overlap    (params.uring_overlap),
+    uring_pipeline   (params.uring_pipeline),
     uring_ebuf       (params.uring_ebuf),
     res              (params.res),
     ctx0             (res->get_ctx()),

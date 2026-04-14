@@ -1617,6 +1617,7 @@ llm_graph_params llama_context::graph_params(
         /*.prefetch_compute_weights=*/ model.prefetch_compute_weights,
         /*.uring_experts=*/ model.uring_experts,
         /*.uring_overlap=*/ model.uring_overlap,
+        /*.uring_pipeline=*/ model.uring_pipeline,
         /*.uring_ebuf  =*/ model.uring_ebuf,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,

@@ -430,6 +430,7 @@ struct common_params {
     int  trace_mode             = 2;     // 0=off, 1=experts only, 2=all (default: all for backwards compat)
     bool uring_experts          = false; // io_uring + O_DIRECT for expert weight loading (compact buffer)
     bool uring_overlap          = false; // overlap down-projection I/O with up+gate compute
+    bool uring_pipeline         = false; // per-expert async pipelining (fused MoE FFN op)
     int  uring_cache_slots      = 0;     // size of the io_uring expert cache (0 = no caching)
     int  uring_cache_policy     = 0;     // 0 = LRU, 1 = LFU (see llama_uring_cache_policy)
     int  uring_aging_mult       = 10;    // LFU-aging period = aging_mult × cache_slots

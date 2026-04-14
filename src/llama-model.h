@@ -499,6 +499,7 @@ struct llama_model {
     // BSC thesis: io_uring + O_DIRECT for expert weight loading
     bool uring_experts = false;
     bool uring_overlap = false;
+    bool uring_pipeline = false;           // per-expert async pipelining (fused MoE FFN op)
     int  uring_cache_slots = 0;            // 0 = no caching
     int  uring_cache_policy = 0;           // 0 = LRU, 1 = LFU
     int  uring_aging_mult = 10;            // LFU-aging period multiplier
