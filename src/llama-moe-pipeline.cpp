@@ -183,12 +183,25 @@ static inline void moe_swiglu_oai_range(float * out, const float * gate, const f
 // Matmul for a single token, producing output rows [i_start, i_end).
 // out[i] = Σ_k W[k, i] * x_q[k], for i in the thread's slice.
 // W_data + i*K_bytes = start of W-row i (ggml storage: nb[1] = K_bytes per row).
+//
+// Mirrors the tiling strategy of ggml_compute_forward_mul_mat_id_one_chunk:
+// batch 16 rows at a time into a stack-local tmp[] buffer and commit with
+// a single memcpy. This keeps x_q hot in L1 across the 16 vec_dot calls
+// (same pointer, same bytes) and coalesces output writes into cache-line-
+// sized stores instead of 16 scattered single-float stores.
 static inline void moe_matvec_range(float * out, const void * W_data, const void * x_q,
                                      int K, int i_start, int i_end, size_t K_bytes,
                                      ggml_vec_dot_t vec_dot) {
-    for (int i = i_start; i < i_end; i++) {
-        const char * W_row = (const char *) W_data + (size_t) i * K_bytes;
-        vec_dot(K, &out[i], 0, W_row, 0, x_q, 0, 1);
+    constexpr int BLK = 16;
+    float tmp[BLK];
+    for (int iir0 = i_start; iir0 < i_end; iir0 += BLK) {
+        const int iir0_end = std::min(iir0 + BLK, i_end);
+        const int nrows = iir0_end - iir0;
+        for (int i = iir0; i < iir0_end; i++) {
+            const char * W_row = (const char *) W_data + (size_t) i * K_bytes;
+            vec_dot(K, &tmp[i - iir0], 0, W_row, 0, x_q, 0, 1);
+        }
+        memcpy(&out[iir0], tmp, (size_t) nrows * sizeof(float));
     }
 }
 
