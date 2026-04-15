@@ -21,8 +21,6 @@
 #include <atomic>
 #include <vector>
 
-#include <pthread.h>
-
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #define MOE_CPU_RELAX() _mm_pause()
@@ -52,13 +50,25 @@ struct moe_pipeline_shared {
     size_t  act_q_row_bytes;   // ggml_row_size(Q8_0, ffn_dim) — stride within act_q_per_expert
     int     n_expert_used;
 
-    // pthread barrier — reusable across every stage and every op invocation
-    // (pthread_barrier_wait handles the reset automatically). Initialised with
-    // the thread count at first use; if the thread count changes later the
-    // barrier is reinitialised.
-    pthread_barrier_t barrier;
-    int barrier_nth;  // thread count the barrier was initialised for; 0 = uninit
-    pthread_mutex_t init_mutex;
+    // Sense-reversing barrier (atomic spin, no syscall).
+    //
+    // Each barrier call:
+    //   1. Each thread reads `barrier_gen` (relaxed) — its "ticket" for this barrier.
+    //   2. Each thread fetch_adds `barrier_count` (seq_cst). The thread that sees
+    //      the old value == nth-1 is the last arriver.
+    //   3. Last arriver: reset count to 0 (relaxed; the fetch_add seq_cst forms
+    //      a fence) and increment `barrier_gen` (seq_cst — release for waiters).
+    //   4. Other threads: spin on `barrier_gen.load(acquire)` until it differs
+    //      from their ticket.
+    //
+    // Generation counter monotonically increases over the program lifetime;
+    // absolute value is irrelevant, only the change-event matters. ~32-bit
+    // counter is safe for any plausible run length (INT_MAX = 2.1B).
+    //
+    // Cache-line aligned to avoid false sharing between threads contending on
+    // count (every barrier writes it) and threads spinning on gen.
+    alignas(64) std::atomic<int> barrier_count;
+    alignas(64) std::atomic<int> barrier_gen;
 
     // Captured dimensions for sanity assertions.
     int n_embd;
@@ -75,8 +85,8 @@ struct moe_pipeline_shared * moe_pipeline_shared_alloc(int n_embd, int ffn_dim, 
     s->act_q_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, ffn_dim);
     s->act_q_per_expert = (char *) malloc((size_t) n_expert_used * s->act_q_row_bytes);
     s->n_expert_used = n_expert_used;
-    s->barrier_nth = 0;
-    pthread_mutex_init(&s->init_mutex, nullptr);
+    s->barrier_count.store(0, std::memory_order_relaxed);
+    s->barrier_gen.store(0, std::memory_order_relaxed);
     s->n_embd = n_embd;
     s->ffn_dim = ffn_dim;
     return s;
@@ -90,28 +100,36 @@ void moe_pipeline_shared_free(struct moe_pipeline_shared * s) {
     free(s->down_out);
     free(s->x_q);
     free(s->act_q_per_expert);
-    if (s->barrier_nth > 0) {
-        pthread_barrier_destroy(&s->barrier);
-    }
-    pthread_mutex_destroy(&s->init_mutex);
     delete s;
 }
 
-// pthread-based barrier. All `nth` threads must call this before any of them
-// proceeds. Init path is mutex-guarded; after first initialisation with a
-// given `nth`, the fast path is a single pthread_barrier_wait.
+// Atomic sense-reversing barrier. Pure userspace, no syscall.
+//
+// Correctness: all `nth` threads must call this. Last arriver to fetch_add
+// the count to nth-1 (returned old value) resets count and bumps gen, which
+// releases the spinners. seq_cst on count.fetch_add and gen.fetch_add forms
+// a total order; combined with release-acquire on gen, all writes by any
+// thread before its fetch_add are visible to all threads after they exit.
+//
+// Caveat: spins instead of sleeping. Costs CPU during long blocks (e.g. the
+// phase2_wait barrier where thread 0 may wait ms on disk). On dedicated CPU
+// cores that's pure energy cost — wall time is unaffected because the
+// spinning threads have no other work to do. ggml_barrier (used by the
+// overlap path) does the same thing, so this is the apples-to-apples choice.
 static inline void moe_barrier(moe_pipeline_shared * s, int nth) {
     if (nth <= 1) return;
-    pthread_mutex_lock(&s->init_mutex);
-    if (s->barrier_nth != nth) {
-        if (s->barrier_nth > 0) {
-            pthread_barrier_destroy(&s->barrier);
+    const int gen = s->barrier_gen.load(std::memory_order_relaxed);
+    if (s->barrier_count.fetch_add(1, std::memory_order_seq_cst) == nth - 1) {
+        // Last arriver: reset for next barrier, then advance gen to release.
+        // The seq_cst fetch_add on gen acts as a release of all writes this
+        // thread made before this point.
+        s->barrier_count.store(0, std::memory_order_relaxed);
+        s->barrier_gen.fetch_add(1, std::memory_order_seq_cst);
+    } else {
+        while (s->barrier_gen.load(std::memory_order_acquire) == gen) {
+            MOE_CPU_RELAX();
         }
-        pthread_barrier_init(&s->barrier, nullptr, nth);
-        s->barrier_nth = nth;
     }
-    pthread_mutex_unlock(&s->init_mutex);
-    pthread_barrier_wait(&s->barrier);
 }
 
 struct llama_moe_pipeline {
