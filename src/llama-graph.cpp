@@ -17,97 +17,6 @@
 #include <sys/mman.h>
 #endif
 
-// BSC thesis: MoE expert weight prefetch via madvise(MADV_WILLNEED)
-// Inserted as a custom graph node between router selection and mul_mat_id.
-// Reads the selected expert IDs, then issues madvise for all 3 projections
-// (up, gate, down) in execution priority order.
-
-struct moe_prefetch_userdata {
-    const ggml_tensor * up_exps;
-    const ggml_tensor * gate_exps;   // may be nullptr
-    const ggml_tensor * down_exps;
-    int64_t n_expert;
-};
-
-static void moe_prefetch_callback(
-        struct ggml_tensor * dst,
-        const struct ggml_tensor * selected_experts,
-        int ith, int /*nth*/, void * userdata) {
-    // only thread 0 issues madvise
-    if (ith != 0) return;
-
-#ifdef __linux__
-    const auto * ud = (const moe_prefetch_userdata *) userdata;
-
-    const int n_ids    = selected_experts->ne[0]; // n_expert_used
-    const int n_tokens = selected_experts->ne[1];
-
-    // each expert tensor has shape [dim0, dim1, n_expert]
-    // stride along the expert dimension = nb[2] (bytes per expert slice)
-    const ggml_tensor * proj_tensors[] = { ud->up_exps, ud->gate_exps, ud->down_exps };
-
-    for (int p = 0; p < 3; p++) {
-        const ggml_tensor * proj = proj_tensors[p];
-        if (!proj || !proj->data) continue;
-
-        const size_t expert_stride = proj->nb[2]; // bytes per expert slice
-
-        for (int t = 0; t < n_tokens; t++) {
-            for (int i = 0; i < n_ids; i++) {
-                const int32_t expert_id = *(const int32_t *)
-                    ((const char *) selected_experts->data + t * selected_experts->nb[1] + i * selected_experts->nb[0]);
-
-                if (expert_id < 0 || expert_id >= ud->n_expert) continue;
-
-                void * addr = (char *) proj->data + expert_id * expert_stride;
-                posix_madvise(addr, expert_stride, POSIX_MADV_WILLNEED);
-            }
-        }
-    }
-#else
-    GGML_UNUSED(userdata);
-#endif
-
-    // pass through: copy selected_experts to dst unchanged
-    if (dst->data != selected_experts->data) {
-        memcpy(dst->data, selected_experts->data, ggml_nbytes(selected_experts));
-    }
-}
-
-// BSC thesis: prefetch next layer's attention/output weights via madvise(MADV_WILLNEED)
-// Inserted before build_moe_ffn so the kernel can load next layer's weights
-// while the current layer's MoE expert computation is page-faulting.
-
-struct attn_prefetch_userdata {
-    const ggml_tensor * tensors[8];
-    int n_tensors;
-};
-
-static void attn_prefetch_callback(
-        struct ggml_tensor * dst,
-        const struct ggml_tensor * src,
-        int ith, int /*nth*/, void * userdata) {
-    if (ith != 0) return;
-
-#ifdef __linux__
-    const auto * ud = (const attn_prefetch_userdata *) userdata;
-
-    for (int i = 0; i < ud->n_tensors; i++) {
-        const ggml_tensor * t = ud->tensors[i];
-        if (t && t->data) {
-            posix_madvise(t->data, ggml_nbytes(t), POSIX_MADV_WILLNEED);
-        }
-    }
-#else
-    GGML_UNUSED(userdata);
-#endif
-
-    // pass through: copy src to dst unchanged
-    if (dst->data != src->data) {
-        memcpy(dst->data, src->data, ggml_nbytes(src));
-    }
-}
-
 // BSC thesis: io_uring expert loading callback
 // Reads selected_experts IDs, loads expert slices via io_uring + O_DIRECT into
 // the compact buffer, then writes remapped IDs [0,1,2,...] to output.
@@ -214,13 +123,13 @@ static void uring_expert_overlap_phase1_callback(
     // Phase 1: load up+gate (bumps epoch, submits, waits)
     int ret = llama_uring_expert_buf_load_phase1(ud->ebuf, ud->layer, expert_ids, n_ids);
     if (ret < 0) {
-        fprintf(stderr, "uring_overlap_phase1: load failed for layer %d\n", ud->layer);
+        fprintf(stderr, "uring_projection_overlap_phase1: load failed for layer %d\n", ud->layer);
     }
 
     // Phase 2: submit down reads (same epoch, async — no wait)
     ret = llama_uring_expert_buf_load_phase2_submit(ud->ebuf, ud->layer, expert_ids, n_ids);
     if (ret < 0) {
-        fprintf(stderr, "uring_overlap_phase2_submit: failed for layer %d\n", ud->layer);
+        fprintf(stderr, "uring_projection_overlap_phase2_submit: failed for layer %d\n", ud->layer);
     }
 
     // Wire up+gate extra ptrs only (projection indices 1+ for gate/up).
@@ -253,7 +162,7 @@ static void uring_expert_overlap_down_wait_callback(
     // Wait for the async down reads submitted by phase1_callback
     int ret = llama_uring_expert_buf_load_phase2_wait(ud->ebuf);
     if (ret < 0) {
-        fprintf(stderr, "uring_overlap_down_wait: wait failed for layer %d\n", ud->layer);
+        fprintf(stderr, "uring_projection_overlap_down_wait: wait failed for layer %d\n", ud->layer);
     }
 
     // Wire down extra ptr (projection index 0)
@@ -267,10 +176,9 @@ static void uring_expert_overlap_down_wait_callback(
 #endif
 }
 
-// Pipeline callbacks: route through llama-moe-pipeline.cpp. Initial stage
-// delegates to the same 2-phase API the overlap path uses, so output is
-// byte-identical. Subsequent commits replace the implementation in
-// llama-moe-pipeline.cpp with real per-expert async pipelining.
+// Async-pipeline callback: routes through llama-moe-pipeline.cpp. Activated
+// by --uring-async-projection-overlap or --uring-async-experts; both are
+// mutually exclusive with --uring-projection-overlap.
 #ifdef __linux__
 #include "llama-moe-pipeline.h"
 
@@ -296,6 +204,10 @@ struct moe_pipeline_fused_userdata {
     // Per-layer scratch + barrier. Lazy-allocated at graph build (single-threaded)
     // the first time this layer is built; reused across decode passes.
     struct moe_pipeline_shared * shared;
+
+    // Dispatch: exactly one of these is true at a time.
+    bool use_async_projection_overlap;  // compute_async_projection_overlap: split-tag (upgate-pair, down) + first-ready dispatch
+    bool use_async_experts;             // compute_async_experts: per-(expert, projection) tags + eager dispatch
 };
 
 static void moe_pipeline_fused_callback(
@@ -334,66 +246,22 @@ static void moe_pipeline_fused_callback(
     args.nth              = nth;
     args.shared           = ud->shared;
 
-    int ret = llama_moe_pipeline_compute_fused(&args);
+    int ret;
+    const char * variant_tag;
+    if (ud->use_async_experts) {
+        ret = llama_moe_pipeline_compute_async_experts(&args);
+        variant_tag = "async-experts";
+    } else {
+        // use_async_projection_overlap: only other reachable mode.
+        ret = llama_moe_pipeline_compute_async_projection_overlap(&args);
+        variant_tag = "async-projection-overlap";
+    }
     if (ret < 0 && ith == 0) {
-        fprintf(stderr, "moe_pipeline_fused: compute failed for layer %d (ret=%d)\n", ud->layer, ret);
+        fprintf(stderr, "moe_pipeline[%s]: compute failed for layer %d (ret=%d)\n",
+                variant_tag, ud->layer, ret);
     }
 }
 #endif
-
-static void uring_expert_pipeline_phase1_callback(
-        struct ggml_tensor * dst,
-        const struct ggml_tensor * selected_experts,
-        int ith, int /*nth*/, void * userdata) {
-    if (ith != 0) return;
-
-#ifdef __linux__
-    const auto * ud = (const uring_expert_userdata *) userdata;
-    const int n_ids = (int)selected_experts->ne[0];
-
-    int32_t expert_ids[LLAMA_URING_MAX_EXPERTS];
-    read_expert_ids(selected_experts, expert_ids, n_ids);
-
-    int ret = llama_moe_pipeline_phase1_load(ud->ebuf, ud->layer, expert_ids, n_ids);
-    if (ret < 0) {
-        fprintf(stderr, "uring_pipeline_phase1: load failed for layer %d\n", ud->layer);
-    }
-
-    // Projection order: 0=down, 1=gate, 2=up. Wire gate+up; down waits for phase2.
-    wire_extra_ptrs(ud, 1, LLAMA_URING_MAX_PROJ);
-
-    write_remapped_ids(dst, selected_experts);
-#else
-    GGML_UNUSED(userdata);
-    if (dst->data != selected_experts->data) {
-        memcpy(dst->data, selected_experts->data, ggml_nbytes(selected_experts));
-    }
-#endif
-}
-
-static void uring_expert_pipeline_down_wait_callback(
-        struct ggml_tensor * dst,
-        const struct ggml_tensor * remapped_experts,
-        const struct ggml_tensor * /*act_result_dep*/,
-        int ith, int /*nth*/, void * userdata) {
-    if (ith != 0) return;
-
-#ifdef __linux__
-    const auto * ud = (const uring_expert_userdata *) userdata;
-
-    int ret = llama_moe_pipeline_phase2_wait(ud->ebuf);
-    if (ret < 0) {
-        fprintf(stderr, "uring_pipeline_down_wait: wait failed for layer %d\n", ud->layer);
-    }
-
-    wire_extra_ptrs(ud, 0, 1);
-
-    memcpy(dst->data, remapped_experts->data, ggml_nbytes(remapped_experts));
-#else
-    GGML_UNUSED(userdata);
-    memcpy(dst->data, remapped_experts->data, ggml_nbytes(remapped_experts));
-#endif
-}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -1029,11 +897,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     cb_func          (params.cb),
-    moe_prefetch     (params.moe_prefetch),
-    prefetch_compute_weights(params.prefetch_compute_weights),
-    uring_experts    (params.uring_experts),
-    uring_overlap    (params.uring_overlap),
-    uring_pipeline   (params.uring_pipeline),
+    uring_experts                       (params.uring_experts),
+    uring_projection_overlap            (params.uring_projection_overlap),
+    uring_async_projection_overlap      (params.uring_async_projection_overlap),
+    uring_async_experts                 (params.uring_async_experts),
     uring_ebuf       (params.uring_ebuf),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1286,27 +1153,6 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
-ggml_tensor * llm_graph_context::build_attn_prefetch(
-        ggml_tensor * cur,
-        const ggml_tensor * const * tensors,
-        int n_tensors,
-        int il) const {
-    if (!prefetch_compute_weights) return cur;
-
-    static attn_prefetch_userdata s_attn_prefetch_data[256];
-    GGML_ASSERT(il >= 0 && il < 256);
-    GGML_ASSERT(n_tensors <= 8);
-
-    s_attn_prefetch_data[il].n_tensors = n_tensors;
-    for (int i = 0; i < n_tensors; i++) {
-        s_attn_prefetch_data[il].tensors[i] = tensors[i];
-    }
-
-    cur = ggml_map_custom1(ctx0, cur, attn_prefetch_callback, 1, &s_attn_prefetch_data[il]);
-    cb(cur, "attn_prefetch", il);
-    return cur;
-}
-
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -1505,10 +1351,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // different tokens may select different experts, so we fall back to the mmap path.
     if (uring_experts && uring_ebuf && n_tokens == 1) {
 #ifdef __linux__
-        // --- --uring-pipeline path: single fused custom op replacing the whole
-        //     up/gate/swiglu/down/accumulate sequence. Currently single-threaded
-        //     and sequential per expert (no async pipelining yet).
-        if (uring_pipeline) {
+        // --- async pipeline path (--uring-async-projection-overlap or --uring-async-experts):
+        //     single fused custom op replacing the whole up/gate/swiglu/down/accumulate sequence,
+        //     with per-expert async I/O dispatched inside the op via tagged io_uring completions.
+        if (uring_async_projection_overlap || uring_async_experts) {
             static moe_pipeline_fused_userdata s_pipeline_data[256];
             GGML_ASSERT(il >= 0 && il < 256);
 
@@ -1528,6 +1374,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             pud.up_exps_b     = up_exps_b;
             pud.gate_exps_b   = gate_exps_b;
             pud.down_exps_b   = down_exps_b;
+            pud.use_async_projection_overlap = uring_async_projection_overlap;
+            pud.use_async_experts            = uring_async_experts;
             // Lazy allocate shared scratch + barrier the first time this layer
             // is built. Subsequent builds reuse the same allocation.
             if (pud.shared == nullptr) {
@@ -1639,14 +1487,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // The callback output (remapped_experts) is a NEW tensor with remapped values.
         ggml_tensor * orig_selected = selected_experts;  // graph node, kept alive by ggml
 
-        // Choose callback: pipeline (per-expert, via llama-moe-pipeline), overlap
-        // (2-phase), or original (all-at-once). Pipeline and overlap are mutually
-        // exclusive; flag validation happens at argv-parse time.
+        // Choose callback: --uring-projection-overlap splits the load into two
+        // phases (up+gate sync, down async with completion before down compute);
+        // the default is the original all-at-once load. The async paths
+        // (--uring-async-projection-overlap, --uring-async-experts) take the
+        // separate fused op above and never reach this code.
         ggml_tensor * remapped_experts;
-        if (uring_pipeline) {
-            remapped_experts = ggml_map_custom1(ctx0, selected_experts,
-                uring_expert_pipeline_phase1_callback, 1, &s_uring_data[il]);
-        } else if (uring_overlap) {
+        if (uring_projection_overlap) {
             remapped_experts = ggml_map_custom1(ctx0, selected_experts,
                 uring_expert_overlap_phase1_callback, 1, &s_uring_data[il]);
         } else {
@@ -1708,14 +1555,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         cb(act_result, "ffn_moe_act", il);
 
-        // Down projection — for overlap, insert a sync point between swiglu and down
-        // that waits for the async down reads and wires compact_down->extra.
+        // Down projection — for projection-overlap, insert a sync point between
+        // swiglu and down that waits for the async down reads and wires
+        // compact_down->extra.
         ggml_tensor * down_ids = remapped_experts;
-        if (uring_pipeline) {
-            down_ids = ggml_map_custom2(ctx0, remapped_experts, act_result,
-                uring_expert_pipeline_down_wait_callback, 1, &s_uring_data[il]);
-            cb(down_ids, "ffn_moe_uring_down_sync", il);
-        } else if (uring_overlap) {
+        if (uring_projection_overlap) {
             // ggml_map_custom2(a=remapped_experts, b=act_result, ...) produces
             // output shaped like a (tiny: 4 × n_tokens int32s). The dependency
             // on b (act_result) ensures this runs AFTER swiglu completes, so
@@ -1756,24 +1600,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(moe_out, "ffn_moe_out", il);
 
         return moe_out;
-    }
-
-    // BSC thesis: insert madvise prefetch node for expert weights
-    if (moe_prefetch) {
-        static moe_prefetch_userdata s_moe_prefetch_data[256];
-        GGML_ASSERT(il >= 0 && il < 256);
-
-        s_moe_prefetch_data[il] = {
-            /*.up_exps   =*/ up_exps,
-            /*.gate_exps =*/ gate_exps,
-            /*.down_exps =*/ down_exps,
-            /*.n_expert  =*/ n_expert,
-        };
-
-        // custom node: reads selected_experts, issues madvise, passes data through
-        selected_experts = ggml_map_custom1(ctx0, selected_experts,
-            moe_prefetch_callback, 1, &s_moe_prefetch_data[il]);
-        cb(selected_experts, "ffn_moe_prefetch", il);
     }
 
     ggml_tensor * up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]

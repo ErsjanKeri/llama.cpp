@@ -26,6 +26,12 @@ struct llama_io_uring_context {
 
     // cumulative metrics
     struct llama_io_uring_metrics metrics;
+
+    // Tagged I/O: completions for non-target tags that arrived early.
+    // Size = LLAMA_IO_URING_MAX_TAGS (16). Tags 0-7 used by per-expert
+    // (upgate-pair, down) split tags in --uring-async-projection-overlap.
+    // Tags 0-11 used by per-(expert, projection) tags in --uring-async-experts.
+    int parked[LLAMA_IO_URING_MAX_TAGS];
 };
 
 // --- Helpers ---
@@ -227,6 +233,236 @@ int llama_io_uring_read_sync(
     if (submitted < 0) return -1;
 
     return llama_io_uring_wait(ctx, submitted);
+}
+
+// --- Phased I/O ---
+
+// Phase tag is stored in bits 60-63 of user_data (4 bits, up to 16 tags).
+// Expanded from 3 bits to 4 bits so v4's per-(expert, projection) scheme fits.
+#define PHASE_TAG_SHIFT 60
+#define PHASE_TAG_MASK  0xFu
+
+static inline int cqe_phase(const struct io_uring_cqe * cqe) {
+    return (int)((cqe->user_data >> PHASE_TAG_SHIFT) & PHASE_TAG_MASK);
+}
+
+int llama_io_uring_submit_phased(
+        struct llama_io_uring_context        * ctx,
+        const struct llama_io_uring_read_req * reqs,
+        int                                    n_reqs,
+        int                                    phase_tag) {
+
+    if (!ctx || !reqs || n_reqs <= 0) return -1;
+    if (phase_tag < 0 || phase_tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    const uint64_t tag_bits = (uint64_t)(phase_tag & PHASE_TAG_MASK) << PHASE_TAG_SHIFT;
+
+    for (int i = 0; i < n_reqs; i++) {
+        struct io_uring_sqe * sqe = io_uring_get_sqe(&ctx->ring);
+        if (!sqe) {
+            io_uring_submit(&ctx->ring);
+            sqe = io_uring_get_sqe(&ctx->ring);
+            if (!sqe) {
+                fprintf(stderr, "llama_io_uring_submit_phased: SQ full\n");
+                return -1;
+            }
+        }
+
+        uint64_t aligned_offset = align_down(reqs[i].file_offset, DIRECT_IO_ALIGN);
+        uint64_t end            = align_up(reqs[i].file_offset + reqs[i].size, DIRECT_IO_ALIGN);
+        size_t   aligned_size   = (size_t)(end - aligned_offset);
+
+        io_uring_prep_read(sqe, ctx->fd, reqs[i].dst, aligned_size, aligned_offset);
+        sqe->user_data = tag_bits | (uint64_t)i;
+
+        ctx->metrics.total_bytes_submitted += aligned_size;
+        ctx->metrics.total_bytes_requested += reqs[i].size;
+    }
+
+    int submitted = io_uring_submit(&ctx->ring);
+    if (submitted < 0) {
+        fprintf(stderr, "llama_io_uring_submit_phased: io_uring_submit failed: %s\n",
+                strerror(-submitted));
+        return -1;
+    }
+
+    ctx->metrics.total_submissions += submitted;
+    return submitted;
+}
+
+int llama_io_uring_wait_phase(
+        struct llama_io_uring_context * ctx,
+        int                            phase_tag,
+        int                            n_expected) {
+
+    if (!ctx || n_expected <= 0) return -1;
+    if (phase_tag < 0 || phase_tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    const int target = phase_tag & PHASE_TAG_MASK;
+    int completed = 0;
+    int errors = 0;
+
+    // Consume any parked completions for our phase first.
+    int from_parked = ctx->parked[target] < n_expected ? ctx->parked[target] : n_expected;
+    completed += from_parked;
+    ctx->parked[target] -= from_parked;
+
+    // Drain CQEs until we have enough matching completions.
+    while (completed < n_expected) {
+        struct io_uring_cqe * cqe;
+        int ret = io_uring_wait_cqe(&ctx->ring, &cqe);
+        if (ret < 0) {
+            fprintf(stderr, "llama_io_uring_wait_phase: io_uring_wait_cqe failed: %s\n",
+                    strerror(-ret));
+            return -1;
+        }
+
+        if (cqe->res < 0) {
+            fprintf(stderr, "llama_io_uring_wait_phase: read failed: %s\n",
+                    strerror(-(cqe->res)));
+            errors++;
+            ctx->metrics.total_errors++;
+        }
+
+        int cqe_tag = cqe_phase(cqe);
+        io_uring_cqe_seen(&ctx->ring, cqe);
+        ctx->metrics.total_completions++;
+
+        if (cqe_tag == target) {
+            completed++;
+        } else {
+            ctx->parked[cqe_tag]++;
+        }
+    }
+
+    struct timespec t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    ctx->metrics.total_wait_ns += (timespec_to_ns(&t_end) - timespec_to_ns(&t_start));
+
+    return errors > 0 ? -1 : 0;
+}
+
+int llama_io_uring_wait_any_tag_ready(
+        struct llama_io_uring_context * ctx,
+        const int                     * tags,
+        const int                     * n_expected_per_tag,
+        int                             n_tags) {
+
+    if (!ctx || !tags || !n_expected_per_tag) return -1;
+    if (n_tags <= 0 || n_tags > LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    // Validate each tag and required count.
+    for (int i = 0; i < n_tags; i++) {
+        if (tags[i] < 0 || tags[i] >= LLAMA_IO_URING_MAX_TAGS) return -1;
+        if (n_expected_per_tag[i] <= 0) return -1;
+    }
+
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    int consumed[LLAMA_IO_URING_MAX_TAGS] = {0};
+    int errors = 0;
+    int winner = -1;
+
+    // Phase 1: satisfy from parked counts for each watched tag.
+    // If a watched tag is already fully parked, pick the FIRST such index as winner.
+    for (int i = 0; i < n_tags; i++) {
+        const int tag  = tags[i];
+        const int need = n_expected_per_tag[i];
+        const int take = ctx->parked[tag] < need ? ctx->parked[tag] : need;
+        consumed[i] = take;
+        ctx->parked[tag] -= take;
+        if (winner < 0 && consumed[i] == need) {
+            winner = i;
+        }
+    }
+
+    // Phase 2: drain CQEs until one watched tag reaches its required count.
+    // Each wait_cqe has a 30-second watchdog timeout so a lost CQE manifests
+    // as an instant diagnostic abort rather than an indefinite process hang.
+    // io_uring_wait_cqe_timeout's struct __kernel_timespec uses tv_sec / tv_nsec.
+    while (winner < 0) {
+        struct io_uring_cqe * cqe;
+        struct __kernel_timespec ts = { .tv_sec = 30, .tv_nsec = 0 };
+        int ret = io_uring_wait_cqe_timeout(&ctx->ring, &cqe, &ts);
+        if (ret == -ETIME) {
+            // Watchdog: a CQE never arrived within 30s. Dump the state we know
+            // about and return -1. Caller will propagate the failure.
+            fprintf(stderr,
+                "[v4-watchdog] io_uring_wait_cqe_timeout fired after 30s — likely deadlock.\n"
+                "[v4-watchdog]   watched tags: ");
+            for (int i = 0; i < n_tags; i++) {
+                fprintf(stderr, "%d(need=%d,got=%d) ",
+                        tags[i], n_expected_per_tag[i], consumed[i]);
+            }
+            fprintf(stderr, "\n[v4-watchdog]   parked[]: ");
+            for (int t = 0; t < LLAMA_IO_URING_MAX_TAGS; t++) {
+                fprintf(stderr, "[%d]=%d ", t, ctx->parked[t]);
+            }
+            fprintf(stderr,
+                "\n[v4-watchdog]   metrics: submissions=%lld completions=%lld errors=%lld\n",
+                (long long)ctx->metrics.total_submissions,
+                (long long)ctx->metrics.total_completions,
+                (long long)ctx->metrics.total_errors);
+            return -1;
+        }
+        if (ret < 0) {
+            fprintf(stderr, "llama_io_uring_wait_any_tag_ready: io_uring_wait_cqe failed: %s\n",
+                    strerror(-ret));
+            return -1;
+        }
+        if (cqe->res < 0) {
+            fprintf(stderr, "llama_io_uring_wait_any_tag_ready: read failed: %s\n",
+                    strerror(-(cqe->res)));
+            errors++;
+            ctx->metrics.total_errors++;
+        }
+        int cqe_tag = cqe_phase(cqe);
+        io_uring_cqe_seen(&ctx->ring, cqe);
+        ctx->metrics.total_completions++;
+
+        // Find a watched index whose tag matches and still needs more.
+        int matched = -1;
+        for (int i = 0; i < n_tags; i++) {
+            if (tags[i] == cqe_tag && consumed[i] < n_expected_per_tag[i]) {
+                matched = i;
+                break;
+            }
+        }
+        if (matched >= 0) {
+            consumed[matched]++;
+            if (consumed[matched] == n_expected_per_tag[matched]) {
+                winner = matched;
+            }
+        } else {
+            // Not watched, or matched tag was already full — park for later.
+            ctx->parked[cqe_tag]++;
+        }
+    }
+
+    // Phase 3: refund losing tags' partial consumes back into parked[], so
+    // subsequent wait_phase / wait_any_tag_ready calls see the correct count.
+    for (int i = 0; i < n_tags; i++) {
+        if (i == winner) continue;
+        ctx->parked[tags[i]] += consumed[i];
+    }
+
+    struct timespec t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    ctx->metrics.total_wait_ns += (timespec_to_ns(&t_end) - timespec_to_ns(&t_start));
+
+    if (errors > 0) return -1;
+    return winner;
+}
+
+void llama_io_uring_reset_phases(struct llama_io_uring_context * ctx) {
+    if (!ctx) return;
+    for (int i = 0; i < LLAMA_IO_URING_MAX_TAGS; i++) {
+        ctx->parked[i] = 0;
+    }
 }
 
 // --- Metrics ---

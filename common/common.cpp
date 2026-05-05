@@ -1379,13 +1379,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_mmap        = params.use_mmap;
     mparams.use_mlock            = params.use_mlock;
     mparams.pin_compute_weights  = params.pin_compute_weights;
-    mparams.moe_prefetch         = params.moe_prefetch;
-    mparams.madvise_random       = params.madvise_random;
-    mparams.prefetch_compute_weights = params.prefetch_compute_weights;
     mparams.trace_mode           = params.trace_mode;
-    mparams.uring_experts        = params.uring_experts;
-    mparams.uring_overlap        = params.uring_overlap;
-    mparams.uring_pipeline       = params.uring_pipeline;
+    mparams.uring_experts                  = params.uring_experts;
+    mparams.uring_projection_overlap       = params.uring_projection_overlap;
+    mparams.uring_async_projection_overlap = params.uring_async_projection_overlap;
+    mparams.uring_async_experts            = params.uring_async_experts;
     mparams.uring_cache_slots    = params.uring_cache_slots;
     mparams.uring_cache_policy   = params.uring_cache_policy;
     mparams.uring_aging_mult     = params.uring_aging_mult;

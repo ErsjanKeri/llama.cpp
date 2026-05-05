@@ -161,6 +161,127 @@ int llama_uring_expert_buf_load_phase2_submit(
 int llama_uring_expert_buf_load_phase2_wait(
         struct llama_uring_expert_buf * buf);
 
+// --- Runtime: per-expert async pipelining ---
+//
+// Loads all 3 projections (down+gate+up) for a SINGLE expert. Used by the
+// fused MoE pipeline op to overlap expert e+1's I/O with expert e's compute.
+//
+//   load_expert_sync():   load + wait (blocking). Use for the first expert.
+//                         bump_epoch=true on first call per layer.
+//   load_expert_async():  submit reads, don't wait. Uses pending_phase2_reads
+//                         counter — drain with phase2_wait() before accessing data.
+//
+// After either call, slot_ptrs[proj][0] contains the pointer for the loaded
+// expert. Callers must save these before the next load call overwrites them.
+
+int llama_uring_expert_buf_load_expert_sync(
+        struct llama_uring_expert_buf * buf,
+        int                             layer,
+        int32_t                         expert_id,
+        bool                            bump_epoch);
+
+int llama_uring_expert_buf_load_expert_async(
+        struct llama_uring_expert_buf * buf,
+        int                             layer,
+        int32_t                         expert_id);
+
+// Tagged per-expert async load — submits all 3 projections for one expert
+// with a specific tag (0..LLAMA_IO_URING_MAX_TAGS-1). Use when submitting
+// multiple experts upfront so each can be waited for independently.
+// Tag MUST be unique per outstanding submission within this layer.
+int llama_uring_expert_buf_load_expert_async_tagged(
+        struct llama_uring_expert_buf * buf,
+        int                             layer,
+        int32_t                         expert_id,
+        int                             tag);
+
+// Same as above but bumps the cache epoch (call once per layer, on the first
+// submission). Subsequent submissions in the same layer must use the non-bump
+// variant so they share the epoch (mutual eviction protection).
+int llama_uring_expert_buf_load_expert_async_tagged_bump(
+        struct llama_uring_expert_buf * buf,
+        int                             layer,
+        int32_t                         expert_id,
+        int                             tag);
+
+// Wait for all async reads submitted with a specific tag to complete.
+// Other tags' completions that arrive are parked for their respective waits.
+int llama_uring_expert_buf_wait_expert_tagged(
+        struct llama_uring_expert_buf * buf,
+        int                             tag);
+
+// --- V3 split-tag helpers (submit one expert's 2-projection or 1-projection subset) ---
+//
+// Pack-file projection ordering is: 0=down, 1=gate, 2=up.
+// upgate = projections [1, n_proj) = gate + up (2 reads per call).
+// down   = projections [0, 1)       = down          (1 read per call).
+//
+// V3 uses two distinct tags per expert: tag=2e for upgate, tag=2e+1 for down.
+// On an n_expert_used=4 model this consumes tags 0..7 which fits LLAMA_IO_URING_MAX_TAGS=8.
+
+// Submit upgate (gate + up) for one expert, async, tagged. No epoch bump.
+int llama_uring_expert_buf_load_upgate_async_tagged(
+        struct llama_uring_expert_buf * buf,
+        int                             layer,
+        int32_t                         expert_id,
+        int                             tag);
+
+// Same as above but bumps the cache epoch. Call once per layer on the very
+// first submission so all subsequent submissions this layer share the epoch
+// (mutual eviction protection).
+int llama_uring_expert_buf_load_upgate_async_tagged_bump(
+        struct llama_uring_expert_buf * buf,
+        int                             layer,
+        int32_t                         expert_id,
+        int                             tag);
+
+// Submit down (single projection) for one expert, async, tagged. No epoch bump.
+int llama_uring_expert_buf_load_down_async_tagged(
+        struct llama_uring_expert_buf * buf,
+        int                             layer,
+        int32_t                         expert_id,
+        int                             tag);
+
+// --- V4 split-tag helpers: one tag per (expert, projection) pair ---
+//
+// Pack-file projection ordering is: 0=down, 1=gate, 2=up.
+// Submits ONE projection of ONE expert under one tag. No epoch bump.
+// V4 uses one tag per (expert, projection): tag = expert*3 + proj_offset
+// where proj_offset is the caller's choice (typically 0..2 mapping to
+// down, gate, up). Total tags for n_expert_used=4 is 12, fitting
+// LLAMA_IO_URING_MAX_TAGS=16.
+int llama_uring_expert_buf_load_proj_async_tagged(
+        struct llama_uring_expert_buf * buf,
+        int                             layer,
+        int32_t                         expert_id,
+        int                             proj,
+        int                             tag);
+
+// Same as above but bumps the cache epoch. Call once per layer on the very
+// first submission so all subsequent submissions this layer share the epoch
+// (mutual eviction protection). For v4 this is the first projection submitted
+// at layer entry.
+int llama_uring_expert_buf_load_proj_async_tagged_bump(
+        struct llama_uring_expert_buf * buf,
+        int                             layer,
+        int32_t                         expert_id,
+        int                             proj,
+        int                             tag);
+
+// V3 first-ready dispatcher: wait until any of the watched upgate tags has
+// received its expected CQEs. Each tag's n_expected is read from the buf's
+// pending_per_tag[]. Returns the WINNING INDEX into upgate_tags[] (0..n_tags-1),
+// or -1 on error. Tags whose pending is already 0 (all cache hits for that
+// expert's upgate pair) are considered "ready" and resolved without a syscall.
+//
+// Losing tags' partial consumed CQEs are refunded to parked[] (see
+// llama_io_uring_wait_any_tag_ready semantics). Winning tag's pending_per_tag
+// is cleared to 0.
+int llama_uring_expert_buf_wait_any_upgate_ready(
+        struct llama_uring_expert_buf * buf,
+        const int                     * upgate_tags,
+        int                             n_tags);
+
 // --- Access ---
 
 // Get the array of n_expert_used void* slot pointers for projection p.
@@ -190,6 +311,7 @@ struct llama_uring_expert_buf_metrics {
     int64_t cache_evictions;
 
     int64_t load_time_ns;      // cumulative time in load() (lookup + submit + wait)
+    int64_t phase2_wait_ns;    // cumulative time blocked in phase2_wait() only
 };
 
 struct llama_uring_expert_buf_metrics llama_uring_expert_buf_get_metrics(

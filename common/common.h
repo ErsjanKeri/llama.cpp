@@ -423,14 +423,12 @@ struct common_params {
     bool use_mmap          = true;  // use mmap for faster loads
     bool use_mlock              = false; // use mlock to keep model in memory
     bool pin_compute_weights    = false; // mlock attn+output weights (not embeddings/experts)
-    bool moe_prefetch           = false; // madvise(MADV_WILLNEED) expert weights after router selection
-    bool madvise_random         = false; // madvise(MADV_RANDOM) on model mmap to disable speculative readahead
-    bool prefetch_compute_weights = false; // madvise(MADV_WILLNEED) next layer's attn+output weights during MoE
     bool eager_compute          = false; // memset compute buffer at alloc to force all pages resident
     int  trace_mode             = 2;     // 0=off, 1=experts only, 2=all (default: all for backwards compat)
-    bool uring_experts          = false; // io_uring + O_DIRECT for expert weight loading (compact buffer)
-    bool uring_overlap          = false; // overlap down-projection I/O with up+gate compute
-    bool uring_pipeline         = false; // per-expert async pipelining (fused MoE FFN op)
+    bool uring_experts                  = false; // io_uring + O_DIRECT for expert weight loading (compact buffer)
+    bool uring_projection_overlap       = false; // overlap down-projection I/O with up+gate compute
+    bool uring_async_projection_overlap = false; // async per-expert split-tag (upgate-pair + down) with first-ready dispatch
+    bool uring_async_experts            = false; // async per-(expert, projection) tags with eager dispatch
     int  uring_cache_slots      = 0;     // size of the io_uring expert cache (0 = no caching)
     int  uring_cache_policy     = 0;     // 0 = LRU, 1 = LFU (see llama_uring_cache_policy)
     int  uring_aging_mult       = 10;    // LFU-aging period = aging_mult × cache_slots

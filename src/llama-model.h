@@ -490,16 +490,11 @@ struct llama_model {
     std::unordered_map<std::string, uint16_t> tensor_file_indices;  // tensor_name → file index (for split models)
 #endif
 
-    // BSC thesis: madvise(MADV_WILLNEED) prefetch for MoE expert weights
-    bool moe_prefetch = false;
-
-    // BSC thesis: madvise(MADV_WILLNEED) prefetch for next layer's attn+output weights during MoE
-    bool prefetch_compute_weights = false;
-
     // BSC thesis: io_uring + O_DIRECT for expert weight loading
-    bool uring_experts = false;
-    bool uring_overlap = false;
-    bool uring_pipeline = false;           // per-expert async pipelining (fused MoE FFN op)
+    bool uring_experts                  = false;
+    bool uring_projection_overlap       = false; // projection-group overlap: down async + up+gate sync
+    bool uring_async_projection_overlap = false; // async per-expert split-tag (upgate-pair + down) + first-ready dispatch
+    bool uring_async_experts            = false; // async per-(expert, projection) tags + eager dispatch
     int  uring_cache_slots = 0;            // 0 = no caching
     int  uring_cache_policy = 0;           // 0 = LRU, 1 = LFU
     int  uring_aging_mult = 10;            // LFU-aging period multiplier

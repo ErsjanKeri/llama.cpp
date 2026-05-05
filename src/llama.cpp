@@ -18,6 +18,7 @@
 
 #ifdef __linux__
 #include "llama-io-uring-buf.h"
+#include "llama-moe-pipeline.h"
 #endif
 
 #include <algorithm>
@@ -1152,8 +1153,17 @@ void llama_model_print_phases(const llama_model * model) {
     // BSC: io_uring expert buffer metrics (only present when --uring-experts is active)
     int64_t uring_loads = 0, uring_reads = 0, uring_bytes_disk = 0, uring_load_ns = 0;
     int64_t uring_hits = 0, uring_misses = 0, uring_evictions = 0;
+    int64_t uring_phase2_wait_ns = 0;
     int     uring_cache_slots  = 0;
     int     uring_cache_policy = 0;
+    // BSC: moe_barrier profiling counters (only meaningful when an async
+    // pipeline variant is active — async-projection-overlap or async-experts).
+    uint64_t moe_barrier_count   = 0;
+    uint64_t moe_barrier_wait_ns = 0;
+    // async-experts picker breakdown: thread 0's pre-barrier time partitioned
+    // into pure compute (state machine) and blocking I/O (wait_any_upgate_ready).
+    uint64_t ae_t0_pick_compute_ns = 0;
+    uint64_t ae_t0_pick_io_wait_ns = 0;
 #ifdef __linux__
     if (model->uring_ebuf) {
         const auto m = llama_uring_expert_buf_get_metrics(model->uring_ebuf);
@@ -1164,9 +1174,14 @@ void llama_model_print_phases(const llama_model * model) {
         uring_hits       = m.cache_hits;
         uring_misses     = m.cache_misses;
         uring_evictions  = m.cache_evictions;
+        uring_phase2_wait_ns = m.phase2_wait_ns;
         uring_cache_slots  = model->uring_cache_slots;
         uring_cache_policy = model->uring_cache_policy;
     }
+    moe_barrier_count   = llama_moe_pipeline_get_barrier_count();
+    moe_barrier_wait_ns = llama_moe_pipeline_get_barrier_wait_ns();
+    ae_t0_pick_compute_ns = llama_moe_pipeline_get_ae_t0_pick_compute_ns();
+    ae_t0_pick_io_wait_ns = llama_moe_pipeline_get_ae_t0_pick_io_wait_ns();
 #endif
 
     LLAMA_LOG_INFO("\n[bsc_phases_json] {"
@@ -1183,8 +1198,11 @@ void llama_model_print_phases(const llama_model * model) {
         "\"uring_cache_slots\": %d, \"uring_cache_policy\": %d, "
         "\"uring_loads\": %" PRId64 ", \"uring_reads\": %" PRId64 ", "
         "\"uring_bytes_disk\": %" PRId64 ", \"uring_load_ms\": %.2f, "
+        "\"uring_phase2_wait_ms\": %.2f, "
         "\"uring_cache_hits\": %" PRId64 ", \"uring_cache_misses\": %" PRId64 ", "
-        "\"uring_cache_evictions\": %" PRId64
+        "\"uring_cache_evictions\": %" PRId64 ", "
+        "\"moe_barrier_count\": %" PRIu64 ", \"moe_barrier_wait_ms\": %.2f, "
+        "\"ae_t0_pick_compute_ms\": %.2f, \"ae_t0_pick_io_wait_ms\": %.2f"
         "}\n",
         t0,
         dur(p.t0_model_start, p.t1_metadata_done), df(p.f0_faults, p.f1_faults),
@@ -1198,7 +1216,10 @@ void llama_model_print_phases(const llama_model * model) {
         dur(p.t0_model_start, p.t8_generation_done), df(p.f0_faults, p.f8_faults),
         uring_cache_slots, uring_cache_policy,
         uring_loads, uring_reads, uring_bytes_disk, uring_load_ns / 1e6,
-        uring_hits, uring_misses, uring_evictions
+        uring_phase2_wait_ns / 1e6,
+        uring_hits, uring_misses, uring_evictions,
+        moe_barrier_count, moe_barrier_wait_ns / 1e6,
+        ae_t0_pick_compute_ns / 1e6, ae_t0_pick_io_wait_ns / 1e6
     );
 }
 

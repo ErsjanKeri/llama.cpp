@@ -431,11 +431,10 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
-    bool moe_prefetch;
-    bool prefetch_compute_weights;
     bool uring_experts;
-    bool uring_overlap;
-    bool uring_pipeline;
+    bool uring_projection_overlap;
+    bool uring_async_projection_overlap;
+    bool uring_async_experts;
 
     struct llama_uring_expert_buf * uring_ebuf;
 
@@ -602,11 +601,10 @@ struct llm_graph_context {
 
     const llm_graph_cb & cb_func;
 
-    const bool moe_prefetch;
-    const bool prefetch_compute_weights;
     const bool uring_experts;
-    const bool uring_overlap;
-    const bool uring_pipeline;
+    const bool uring_projection_overlap;
+    const bool uring_async_projection_overlap;
+    const bool uring_async_experts;
 
     struct llama_uring_expert_buf * uring_ebuf;
 
@@ -700,13 +698,6 @@ struct llm_graph_context {
             llama_expert_gating_func_type gating_op,
                      int   il,
              ggml_tensor * probs_in = nullptr) const;
-
-    // BSC thesis: prefetch next layer's attention/output weights via madvise(MADV_WILLNEED)
-    ggml_tensor * build_attn_prefetch(
-            ggml_tensor * cur,
-            const ggml_tensor * const * tensors,
-                     int   n_tensors,
-                     int   il) const;
 
     //
     // inputs

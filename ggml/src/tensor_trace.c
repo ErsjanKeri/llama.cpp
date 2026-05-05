@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -22,17 +23,23 @@ static void tensor_trace_shutdown_buffer_stats(void);
 
 // === Global State ===
 
-// Memory-mapped log buffer
+// Memory-mapped log buffer. Writes are serialized via an atomic offset:
+// each call to tensor_trace_log() reserves an entry-sized region with
+// atomic_fetch_add, then writes its 1024 bytes there. There is no
+// per-thread batching.
+//
+// Lifetime: init runs at most once per process (idempotent on repeat calls);
+// the public tensor_trace_shutdown() entry point is a no-op so that
+// llama_model_free() calling it during the params-fit probe does not tear
+// the buffer down before inference. Real teardown runs once at process
+// exit via the atexit-registered tensor_trace_atexit().
 static void* g_log_buffer = NULL;
-static size_t g_log_capacity = 0;      // Total capacity in bytes
-static size_t g_log_offset = 0;        // Current write offset (not thread-safe, needs atomics later)
-static int g_log_fd = -1;              // File descriptor for log file
-static uint64_t g_trace_start_ns = 0;  // Trace start time (for relative timestamps)
-
-// Thread-local buffer for batching writes (avoid contention)
-#define THREAD_LOCAL_BUFFER_SIZE 512  // 512 entries = 512KB per thread (1024 bytes each)
-static __thread struct TensorAccessLog g_thread_local_buffer[THREAD_LOCAL_BUFFER_SIZE];
-static __thread size_t g_thread_local_offset = 0;
+static size_t g_log_capacity = 0;          // Total capacity in bytes
+static _Atomic size_t g_log_offset = 0;    // Reserved-bytes counter (atomic)
+static int g_log_fd = -1;                  // File descriptor for log file
+static uint64_t g_trace_start_ns = 0;      // Trace start time (for relative timestamps)
+static int g_init_done = 0;                // 1 = init has run successfully once
+static int g_atexit_done = 0;              // 1 = process-exit teardown has run
 
 // Global execution context (Phase 1.1+)
 static int g_trace_enabled = 1;
@@ -78,9 +85,34 @@ uint16_t tensor_trace_get_thread_id(void) {
 
 // === Core API Implementation ===
 
+// Real teardown: runs exactly once at process exit, regardless of how many
+// models were loaded and freed during the run.
+static void tensor_trace_atexit(void) {
+    if (g_atexit_done) return;
+    g_atexit_done = 1;
+    if (g_log_buffer == NULL) return;
+
+    msync(g_log_buffer, g_log_capacity, MS_SYNC);
+    munmap(g_log_buffer, g_log_capacity);
+    close(g_log_fd);
+
+    size_t final_offset = atomic_load_explicit(&g_log_offset, memory_order_relaxed);
+    size_t num_entries = final_offset / sizeof(struct TensorAccessLog);
+    printf("[TENSOR_TRACE] Shutdown: %zu entries logged (%.2f MB)\n",
+           num_entries, final_offset / (1024.0 * 1024.0));
+
+    tensor_trace_shutdown_buffer_stats();
+
+    g_log_buffer = NULL;
+    g_log_capacity = 0;
+    atomic_store_explicit(&g_log_offset, 0, memory_order_relaxed);
+    g_log_fd = -1;
+}
+
 void tensor_trace_init(const char* log_path, size_t capacity_bytes) {
-    if (g_log_buffer != NULL) {
-        fprintf(stderr, "[TENSOR_TRACE] Error: Already initialized\n");
+    if (g_init_done) {
+        // Already initialized once this process. Subsequent calls (from
+        // the real model load after a params-fit probe load) are no-ops.
         return;
     }
 
@@ -116,10 +148,15 @@ void tensor_trace_init(const char* log_path, size_t capacity_bytes) {
     }
 
     g_log_capacity = capacity_bytes;
-    g_log_offset = 0;
+    atomic_store_explicit(&g_log_offset, 0, memory_order_relaxed);
 
-    // Initialize buffer stats tracking (Phase 1.3)
     tensor_trace_init_buffer_stats();
+
+    // Real teardown runs once at process exit; the public shutdown entry
+    // point is a no-op so intermediate model_free() calls do not tear the
+    // buffer down.
+    g_init_done = 1;
+    atexit(tensor_trace_atexit);
 
     printf("[TENSOR_TRACE] Initialized: %s (%.2f GB capacity)\n",
            log_path, capacity_bytes / (1024.0 * 1024.0 * 1024.0));
@@ -130,70 +167,36 @@ void tensor_trace_log(const struct TensorAccessLog* entry) {
         return;  // Not initialized, silently skip
     }
 
-    // Add to thread-local buffer
-    g_thread_local_buffer[g_thread_local_offset++] = *entry;
+    const size_t entry_size = sizeof(struct TensorAccessLog);
 
-    // Flush when buffer is full
-    if (g_thread_local_offset >= THREAD_LOCAL_BUFFER_SIZE) {
-        // TODO: Add atomic operation here for thread safety
-        // For MVP, we'll use simple (non-thread-safe) flush
+    // Atomically reserve entry_size bytes in the global buffer. Each call
+    // gets a unique, non-overlapping region; the write is then a simple
+    // memcpy. relaxed ordering is sufficient because we never read the
+    // buffer back inside the program: it is consumed by the offline parser
+    // after process shutdown.
+    size_t my_offset = atomic_fetch_add_explicit(
+        &g_log_offset, entry_size, memory_order_relaxed);
 
-        size_t bytes_to_write = g_thread_local_offset * sizeof(struct TensorAccessLog);
-
-        // Check capacity
-        if (g_log_offset + bytes_to_write <= g_log_capacity) {
-            // Copy thread-local buffer to global mmap'd buffer
-            memcpy((char*)g_log_buffer + g_log_offset,
-                   g_thread_local_buffer,
-                   bytes_to_write);
-            g_log_offset += bytes_to_write;
-        } else {
-            fprintf(stderr, "[TENSOR_TRACE] Warning: Log buffer full, dropping entries\n");
-        }
-
-        // Reset thread-local buffer
-        g_thread_local_offset = 0;
+    if (my_offset + entry_size <= g_log_capacity) {
+        memcpy((char*)g_log_buffer + my_offset, entry, entry_size);
+    } else {
+        // Capacity exceeded — roll back the reservation so the printed
+        // entry-count at shutdown stays accurate, then drop this entry.
+        atomic_fetch_sub_explicit(&g_log_offset, entry_size, memory_order_relaxed);
+        // Note: we do not log a warning here because at the point this fires
+        // every subsequent entry would also fire it, flooding stderr.
     }
 }
 
+// Public shutdown entry point: no-op. The real teardown is registered with
+// atexit() inside tensor_trace_init(). This indirection exists because
+// llama_model_free() calls tensor_trace_shutdown() unconditionally; during
+// llama_params_fit's probe-then-free cycle that would munmap the buffer
+// before any inference and the second model load's init would re-truncate
+// the file, dropping all subsequent entries. Keeping shutdown a no-op and
+// running the real teardown only at process exit fixes that.
 void tensor_trace_shutdown(void) {
-    if (g_log_buffer == NULL) {
-        return;  // Not initialized
-    }
-
-    // Flush remaining thread-local entries
-    if (g_thread_local_offset > 0) {
-        size_t bytes_to_write = g_thread_local_offset * sizeof(struct TensorAccessLog);
-
-        if (g_log_offset + bytes_to_write <= g_log_capacity) {
-            memcpy((char*)g_log_buffer + g_log_offset,
-                   g_thread_local_buffer,
-                   bytes_to_write);
-            g_log_offset += bytes_to_write;
-        }
-
-        g_thread_local_offset = 0;
-    }
-
-    // Sync to disk
-    msync(g_log_buffer, g_log_capacity, MS_SYNC);
-
-    // Unmap and close
-    munmap(g_log_buffer, g_log_capacity);
-    close(g_log_fd);
-
-    size_t num_entries = g_log_offset / sizeof(struct TensorAccessLog);
-    printf("[TENSOR_TRACE] Shutdown: %zu entries logged (%.2f MB)\n",
-           num_entries, g_log_offset / (1024.0 * 1024.0));
-
-    // Shutdown buffer stats tracking (Phase 1.3)
-    tensor_trace_shutdown_buffer_stats();
-
-    // Reset state
-    g_log_buffer = NULL;
-    g_log_capacity = 0;
-    g_log_offset = 0;
-    g_log_fd = -1;
+    return;
 }
 
 void tensor_trace_register_tensor(

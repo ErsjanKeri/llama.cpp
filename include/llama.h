@@ -311,12 +311,10 @@ extern "C" {
         bool use_mmap;        // use mmap if possible
         bool use_mlock;             // force system to keep model in RAM
         bool pin_compute_weights;   // mlock attention+output weights (not embeddings/experts)
-        bool moe_prefetch;          // madvise(MADV_WILLNEED) expert weights after router selection
-        bool madvise_random;        // madvise(MADV_RANDOM) on model mmap to disable speculative readahead
-        bool prefetch_compute_weights; // madvise(MADV_WILLNEED) next layer's attn+output weights during MoE
-        bool uring_experts;           // io_uring + O_DIRECT for expert weight loading
-        bool uring_overlap;           // overlap down-projection I/O with up+gate compute
-        bool uring_pipeline;          // per-expert async pipelining (fused MoE FFN op)
+        bool uring_experts;                  // io_uring + O_DIRECT for expert weight loading
+        bool uring_projection_overlap;       // overlap down-projection I/O with up+gate compute
+        bool uring_async_projection_overlap; // async per-expert split-tag (upgate-pair + down) with first-ready dispatch
+        bool uring_async_experts;            // async per-(expert, projection) tags with eager dispatch
         int  uring_cache_slots;       // io_uring expert cache size (0 = no caching)
         int  uring_cache_policy;      // 0 = LRU, 1 = LFU
         int  uring_aging_mult;       // LFU-aging period = mult × cache_slots (default: 10)

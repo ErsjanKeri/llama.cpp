@@ -116,6 +116,12 @@ struct llama_uring_expert_buf {
     // this. Zero when no async reads are in flight.
     int pending_phase2_reads = 0;
 
+    // Per-tag pending counters for the async pipeline paths
+    // (--uring-async-projection-overlap, --uring-async-experts).
+    // Tag T counts async reads submitted with tag T (via load_expert_async_tagged
+    // or load_expert_async_tagged_pair). Drained by wait_expert_tagged(tag).
+    int pending_per_tag[LLAMA_IO_URING_MAX_TAGS] = {0};
+
     // Global frequency table (incremented on every access, hit or miss).
     std::vector<uint32_t> freq_table;
 
@@ -318,7 +324,8 @@ static int load_projections(
         int                      p_end,
         bool                     bump_epoch,
         bool                     do_wait,
-        bool                     do_warmup_pad) {
+        bool                     do_warmup_pad,
+        int                      phase_tag = -1) {
 
     const int64_t t_start = clock_ns();
 
@@ -436,21 +443,37 @@ static int load_projections(
 
     // Submit io_uring batch
     if (n_reqs > 0) {
-        int submitted = llama_io_uring_submit(buf->io_ctx, reqs, n_reqs);
+        int submitted;
+        if (phase_tag >= 0) {
+            submitted = llama_io_uring_submit_phased(buf->io_ctx, reqs, n_reqs, phase_tag);
+        } else {
+            submitted = llama_io_uring_submit(buf->io_ctx, reqs, n_reqs);
+        }
         if (submitted < 0) {
             fprintf(stderr, "load_projections: submit failed\n");
             return -1;
         }
 
         if (do_wait) {
-            int ret = llama_io_uring_wait(buf->io_ctx, submitted);
+            int ret;
+            if (phase_tag >= 0) {
+                ret = llama_io_uring_wait_phase(buf->io_ctx, phase_tag, submitted);
+            } else {
+                ret = llama_io_uring_wait(buf->io_ctx, submitted);
+            }
             if (ret < 0) {
                 fprintf(stderr, "load_projections: wait failed\n");
                 return -1;
             }
         } else {
-            // Async: store pending count for phase2_wait()
-            buf->pending_phase2_reads += submitted;
+            // Async: store pending count for later wait.
+            // Tagged submits (phase_tag >= 0) update pending_per_tag[tag];
+            // untagged submits update pending_phase2_reads for the legacy API.
+            if (phase_tag >= 0 && phase_tag < LLAMA_IO_URING_MAX_TAGS) {
+                buf->pending_per_tag[phase_tag] += submitted;
+            } else {
+                buf->pending_phase2_reads += submitted;
+            }
         }
 
         buf->metrics.reads_submitted += n_reqs;
@@ -590,9 +613,254 @@ int llama_uring_expert_buf_load_phase2_wait(
     const int64_t t_start = clock_ns();
     int ret = llama_io_uring_wait(buf->io_ctx, buf->pending_phase2_reads);
     buf->pending_phase2_reads = 0;
-    buf->metrics.load_time_ns += (clock_ns() - t_start);
+    const int64_t elapsed = clock_ns() - t_start;
+    buf->metrics.load_time_ns   += elapsed;
+    buf->metrics.phase2_wait_ns += elapsed;
 
     return (ret < 0) ? -1 : 0;
+}
+
+// --- Per-expert async pipelining API ---
+
+int llama_uring_expert_buf_load_expert_sync(
+        llama_uring_expert_buf * buf,
+        int                      layer,
+        int32_t                  expert_id,
+        bool                     bump_epoch) {
+
+    if (!buf) return -1;
+    if (layer < 0 || layer >= buf->n_layers) return -1;
+
+    if (bump_epoch) {
+        buf->metrics.loads += 1;
+    }
+
+    // Load all 3 projections (down=0, gate=1, up=2) for this single expert.
+    // n_ids=1, p_start=0, p_end=n_proj, sync wait.
+    return load_projections(buf, layer, &expert_id, /*n_ids=*/1,
+                            /*p_start=*/0, /*p_end=*/buf->n_proj,
+                            /*bump_epoch=*/bump_epoch, /*do_wait=*/true,
+                            /*do_warmup_pad=*/false);
+}
+
+int llama_uring_expert_buf_load_expert_async(
+        llama_uring_expert_buf * buf,
+        int                      layer,
+        int32_t                  expert_id) {
+
+    if (!buf) return -1;
+    if (layer < 0 || layer >= buf->n_layers) return -1;
+
+    // Load all 3 projections for this expert, async (no wait).
+    // Same epoch as the sync call that preceded it (no bump).
+    // Caller must drain with phase2_wait() before accessing data.
+    return load_projections(buf, layer, &expert_id, /*n_ids=*/1,
+                            /*p_start=*/0, /*p_end=*/buf->n_proj,
+                            /*bump_epoch=*/false, /*do_wait=*/false,
+                            /*do_warmup_pad=*/false);
+}
+
+int llama_uring_expert_buf_load_expert_async_tagged(
+        llama_uring_expert_buf * buf,
+        int                      layer,
+        int32_t                  expert_id,
+        int                      tag) {
+
+    if (!buf) return -1;
+    if (layer < 0 || layer >= buf->n_layers) return -1;
+    if (tag < 0 || tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    // Submits all 3 projections for this expert async, tagged.
+    // pending_per_tag[tag] += n_reads. Use wait_expert_tagged(tag) to drain.
+    return load_projections(buf, layer, &expert_id, /*n_ids=*/1,
+                            /*p_start=*/0, /*p_end=*/buf->n_proj,
+                            /*bump_epoch=*/false, /*do_wait=*/false,
+                            /*do_warmup_pad=*/false,
+                            /*phase_tag=*/tag);
+}
+
+int llama_uring_expert_buf_load_expert_async_tagged_bump(
+        llama_uring_expert_buf * buf,
+        int                      layer,
+        int32_t                  expert_id,
+        int                      tag) {
+
+    if (!buf) return -1;
+    if (layer < 0 || layer >= buf->n_layers) return -1;
+    if (tag < 0 || tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    buf->metrics.loads += 1;  // first load per layer counts as one "load op"
+
+    return load_projections(buf, layer, &expert_id, /*n_ids=*/1,
+                            /*p_start=*/0, /*p_end=*/buf->n_proj,
+                            /*bump_epoch=*/true, /*do_wait=*/false,
+                            /*do_warmup_pad=*/false,
+                            /*phase_tag=*/tag);
+}
+
+int llama_uring_expert_buf_wait_expert_tagged(
+        llama_uring_expert_buf * buf,
+        int                      tag) {
+
+    if (!buf) return -1;
+    if (tag < 0 || tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    const int n = buf->pending_per_tag[tag];
+    if (n == 0) return 0;  // all hits for this expert, nothing to wait
+
+    const int64_t t_start = clock_ns();
+    int ret = llama_io_uring_wait_phase(buf->io_ctx, tag, n);
+    buf->pending_per_tag[tag] = 0;
+    const int64_t elapsed = clock_ns() - t_start;
+    buf->metrics.load_time_ns   += elapsed;
+    buf->metrics.phase2_wait_ns += elapsed;
+
+    return (ret < 0) ? -1 : 0;
+}
+
+// --- V3 split-tag helpers ---
+//
+// Pack layout: projection 0 = down, 1 = gate, 2 = up. upgate = [1, n_proj),
+// down = [0, 1). Thin wrappers over load_projections() with narrow p_start/p_end
+// and async (do_wait=false). bump_epoch only on the first submission per layer.
+
+int llama_uring_expert_buf_load_upgate_async_tagged(
+        llama_uring_expert_buf * buf,
+        int                      layer,
+        int32_t                  expert_id,
+        int                      tag) {
+
+    if (!buf) return -1;
+    if (layer < 0 || layer >= buf->n_layers) return -1;
+    if (tag < 0 || tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    // gate + up = projections [1, n_proj). Async, same epoch, tagged.
+    return load_projections(buf, layer, &expert_id, /*n_ids=*/1,
+                            /*p_start=*/1, /*p_end=*/buf->n_proj,
+                            /*bump_epoch=*/false, /*do_wait=*/false,
+                            /*do_warmup_pad=*/false,
+                            /*phase_tag=*/tag);
+}
+
+int llama_uring_expert_buf_load_upgate_async_tagged_bump(
+        llama_uring_expert_buf * buf,
+        int                      layer,
+        int32_t                  expert_id,
+        int                      tag) {
+
+    if (!buf) return -1;
+    if (layer < 0 || layer >= buf->n_layers) return -1;
+    if (tag < 0 || tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    buf->metrics.loads += 1;  // first submission per layer counts as one load op
+
+    return load_projections(buf, layer, &expert_id, /*n_ids=*/1,
+                            /*p_start=*/1, /*p_end=*/buf->n_proj,
+                            /*bump_epoch=*/true, /*do_wait=*/false,
+                            /*do_warmup_pad=*/false,
+                            /*phase_tag=*/tag);
+}
+
+int llama_uring_expert_buf_load_down_async_tagged(
+        llama_uring_expert_buf * buf,
+        int                      layer,
+        int32_t                  expert_id,
+        int                      tag) {
+
+    if (!buf) return -1;
+    if (layer < 0 || layer >= buf->n_layers) return -1;
+    if (tag < 0 || tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    // down only = projection [0, 1). Async, same epoch, tagged.
+    return load_projections(buf, layer, &expert_id, /*n_ids=*/1,
+                            /*p_start=*/0, /*p_end=*/1,
+                            /*bump_epoch=*/false, /*do_wait=*/false,
+                            /*do_warmup_pad=*/false,
+                            /*phase_tag=*/tag);
+}
+
+// --- V4 per-(expert, projection) split-tag helpers ---
+
+int llama_uring_expert_buf_load_proj_async_tagged(
+        llama_uring_expert_buf * buf,
+        int                      layer,
+        int32_t                  expert_id,
+        int                      proj,
+        int                      tag) {
+
+    if (!buf) return -1;
+    if (layer < 0 || layer >= buf->n_layers) return -1;
+    if (proj < 0 || proj >= buf->n_proj) return -1;
+    if (tag < 0 || tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    // Single projection [proj, proj+1). Async, same epoch, tagged.
+    return load_projections(buf, layer, &expert_id, /*n_ids=*/1,
+                            /*p_start=*/proj, /*p_end=*/proj + 1,
+                            /*bump_epoch=*/false, /*do_wait=*/false,
+                            /*do_warmup_pad=*/false,
+                            /*phase_tag=*/tag);
+}
+
+int llama_uring_expert_buf_load_proj_async_tagged_bump(
+        llama_uring_expert_buf * buf,
+        int                      layer,
+        int32_t                  expert_id,
+        int                      proj,
+        int                      tag) {
+
+    if (!buf) return -1;
+    if (layer < 0 || layer >= buf->n_layers) return -1;
+    if (proj < 0 || proj >= buf->n_proj) return -1;
+    if (tag < 0 || tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    buf->metrics.loads += 1;  // first submission per layer counts as one load op
+
+    return load_projections(buf, layer, &expert_id, /*n_ids=*/1,
+                            /*p_start=*/proj, /*p_end=*/proj + 1,
+                            /*bump_epoch=*/true, /*do_wait=*/false,
+                            /*do_warmup_pad=*/false,
+                            /*phase_tag=*/tag);
+}
+
+int llama_uring_expert_buf_wait_any_upgate_ready(
+        llama_uring_expert_buf * buf,
+        const int              * upgate_tags,
+        int                      n_tags) {
+
+    if (!buf || !upgate_tags) return -1;
+    if (n_tags <= 0 || n_tags > LLAMA_IO_URING_MAX_TAGS) return -1;
+
+    // Validate tags and build n_expected from current pending counts.
+    int n_expected[LLAMA_IO_URING_MAX_TAGS];
+    for (int i = 0; i < n_tags; i++) {
+        const int tag = upgate_tags[i];
+        if (tag < 0 || tag >= LLAMA_IO_URING_MAX_TAGS) return -1;
+        n_expected[i] = buf->pending_per_tag[tag];
+    }
+
+    // Shortcut: if ANY tag has 0 pending (all cache hits for that upgate pair),
+    // it's already fully satisfied — no syscall needed, return that index.
+    for (int i = 0; i < n_tags; i++) {
+        if (n_expected[i] == 0) {
+            return i;
+        }
+    }
+
+    const int64_t t_start = clock_ns();
+    int winner = llama_io_uring_wait_any_tag_ready(
+        buf->io_ctx, upgate_tags, n_expected, n_tags);
+    const int64_t elapsed = clock_ns() - t_start;
+    buf->metrics.load_time_ns   += elapsed;
+    buf->metrics.phase2_wait_ns += elapsed;
+
+    if (winner < 0) return -1;
+
+    // Only the winning tag's pending is "claimed" by this call.
+    // Losing tags keep their pending count (their partial progress
+    // was refunded to parked[] inside wait_any_tag_ready, and will be
+    // consumed by a future wait_any / wait_phase).
+    buf->pending_per_tag[upgate_tags[winner]] = 0;
+    return winner;
 }
 
 // =============================================================================

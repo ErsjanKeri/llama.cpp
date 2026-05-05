@@ -2056,27 +2056,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TRACE_MODE"));
     add_opt(common_arg(
-        {"--moe-prefetch"},
-        "use madvise(MADV_WILLNEED) to prefetch expert weights after router selection, before mul_mat_id accesses them",
-        [](common_params & params) {
-            params.moe_prefetch = true;
-        }
-    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
-    add_opt(common_arg(
-        {"--madvise-random"},
-        "use madvise(MADV_RANDOM) on model mmap to disable kernel speculative readahead on page faults",
-        [](common_params & params) {
-            params.madvise_random = true;
-        }
-    ).set_env("LLAMA_ARG_MADVISE_RANDOM"));
-    add_opt(common_arg(
-        {"--prefetch-compute-weights"},
-        "use madvise(MADV_WILLNEED) to prefetch next layer's attention+output weights during MoE computation",
-        [](common_params & params) {
-            params.prefetch_compute_weights = true;
-        }
-    ).set_env("LLAMA_ARG_PREFETCH_COMPUTE_WEIGHTS"));
-    add_opt(common_arg(
         {"--uring-experts"},
         "use io_uring + O_DIRECT for expert weight loading into compact buffer (Linux only, bypasses page cache)",
         [](common_params & params) {
@@ -2084,26 +2063,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_URING_EXPERTS"));
     add_opt(common_arg(
-        {"--uring-overlap"},
-        "overlap down-projection io_uring reads with up+gate compute (requires --uring-experts; mutually exclusive with --uring-pipeline)",
+        {"--uring-projection-overlap"},
+        "projection-group overlap: load up+gate sync (QD=8), submit down async (QD=4), "
+        "compute up+gate+swiglu while down I/O is in flight, then wait for down. "
+        "Requires --uring-experts; mutually exclusive with --uring-async-projection-overlap and --uring-async-experts.",
         [](common_params & params) {
-            if (params.uring_pipeline) {
-                throw std::invalid_argument("--uring-overlap is mutually exclusive with --uring-pipeline");
+            if (params.uring_async_projection_overlap || params.uring_async_experts) {
+                throw std::invalid_argument("--uring-projection-overlap is mutually exclusive with --uring-async-projection-overlap/--uring-async-experts");
             }
-            params.uring_overlap = true;
+            params.uring_projection_overlap = true;
         }
-    ).set_env("LLAMA_ARG_URING_OVERLAP"));
+    ).set_env("LLAMA_ARG_URING_PROJECTION_OVERLAP"));
     add_opt(common_arg(
-        {"--uring-pipeline"},
-        "per-expert async pipelining: fused MoE FFN op advances each expert as its weights arrive "
-        "(requires --uring-experts; mutually exclusive with --uring-overlap)",
+        {"--uring-async-projection-overlap"},
+        "async projection-group overlap: per-expert split-tag pipelining (upgate-pair + down-single per expert) "
+        "with first-ready dynamic dispatch. Submits 4 upgate-pairs (tags 0,2,4,6) + 4 down-singles (tags 1,3,5,7) "
+        "at layer entry; computes whichever expert's (up,gate) pair arrives first, defers down until after swiglu. "
+        "Requires --uring-experts; mutually exclusive with --uring-projection-overlap and --uring-async-experts.",
         [](common_params & params) {
-            if (params.uring_overlap) {
-                throw std::invalid_argument("--uring-pipeline is mutually exclusive with --uring-overlap");
+            if (params.uring_projection_overlap || params.uring_async_experts) {
+                throw std::invalid_argument("--uring-async-projection-overlap is mutually exclusive with --uring-projection-overlap/--uring-async-experts");
             }
-            params.uring_pipeline = true;
+            params.uring_async_projection_overlap = true;
         }
-    ).set_env("LLAMA_ARG_URING_PIPELINE"));
+    ).set_env("LLAMA_ARG_URING_ASYNC_PROJECTION_OVERLAP"));
+    add_opt(common_arg(
+        {"--uring-async-experts"},
+        "async per-expert pipelining: per-(expert, projection) tags + eager dispatch. Submits 12 individual reads "
+        "(4 experts x 3 projections: up, gate, down) with distinct tags 0-11; each matmul starts as soon as its "
+        "weight arrives instead of waiting for the up+gate pair. Output is indexed by expert id and reduced in "
+        "fixed expert-id order for bit-exactness vs --uring-async-projection-overlap. "
+        "Requires --uring-experts; mutually exclusive with --uring-projection-overlap and --uring-async-projection-overlap.",
+        [](common_params & params) {
+            if (params.uring_projection_overlap || params.uring_async_projection_overlap) {
+                throw std::invalid_argument("--uring-async-experts is mutually exclusive with --uring-projection-overlap/--uring-async-projection-overlap");
+            }
+            params.uring_async_experts = true;
+        }
+    ).set_env("LLAMA_ARG_URING_ASYNC_EXPERTS"));
     add_opt(common_arg(
         {"--uring-cache-slots"}, "N",
         "io_uring expert cache size in slots (0 = no caching). Each slot is one expert "

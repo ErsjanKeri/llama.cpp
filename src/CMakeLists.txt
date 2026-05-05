@@ -165,6 +165,19 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 endif()
 
+# BSC thesis: link OpenMP so llama-moe-pipeline.cpp can use `#pragma omp barrier`
+# (we observed the hand-rolled sense-reversing barrier deadlocking intermittently
+# under v4's higher barrier-crossing rate; libgomp's team barrier is robust by
+# construction). ggml-cpu already builds with -fopenmp via GGML_OPENMP, but that
+# does not propagate to consumers; we add it here explicitly.
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(llama PRIVATE OpenMP::OpenMP_CXX)
+    message(STATUS "Linking llama with OpenMP for moe-pipeline barrier")
+else()
+    message(WARNING "OpenMP not found — moe-pipeline-v4 may deadlock under load")
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

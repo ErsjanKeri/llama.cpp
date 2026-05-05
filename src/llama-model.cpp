@@ -7055,25 +7055,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     bsc_print_rss("after pin_compute_weights (mlock done)");
 
-    // BSC: store moe_prefetch flag for use during graph construction
-    moe_prefetch = params.moe_prefetch;
-    if (moe_prefetch) {
-        LLAMA_LOG_INFO("%s: moe_prefetch: enabled — will madvise(MADV_WILLNEED) expert weights after router selection\n", __func__);
-    }
-
-    // BSC: store prefetch_compute_weights flag for use during graph construction
-    prefetch_compute_weights = params.prefetch_compute_weights;
-    if (prefetch_compute_weights) {
-        LLAMA_LOG_INFO("%s: prefetch_compute_weights: enabled — will madvise(MADV_WILLNEED) next layer's attn+output weights during MoE\n", __func__);
-    }
-
     // BSC: store uring_experts flag and initialize the io_uring engine +
     // expert buffer manager from the .bscexp sidecar pack file. The pack
     // file is REQUIRED — there is no fallback to the GGUF mmap path. Run
     // tools/bsc-pack-experts to generate it once per model.
-    uring_experts      = params.uring_experts;
-    uring_overlap      = params.uring_overlap;
-    uring_pipeline     = params.uring_pipeline;
+    uring_experts                  = params.uring_experts;
+    uring_projection_overlap       = params.uring_projection_overlap;
+    uring_async_projection_overlap = params.uring_async_projection_overlap;
+    uring_async_experts            = params.uring_async_experts;
     uring_cache_slots  = params.uring_cache_slots;
     uring_cache_policy = params.uring_cache_policy;
     uring_aging_mult   = params.uring_aging_mult;
@@ -7217,32 +7206,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             cfg.cache_slots);
     }
     bsc_print_rss("after uring_expert_buf_init (cache buffer allocated via posix_memalign)");
-#endif
-
-    // BSC: prefetch layer 0 attention weights at load time (no MoE to overlap with, but kernel can start readahead)
-#ifdef __linux__
-    if (prefetch_compute_weights && !layers.empty()) {
-        const auto & l0 = layers[0];
-        const ggml_tensor * l0_tensors[] = { l0.wq, l0.wk, l0.wv, l0.wo, l0.attn_norm };
-        for (const auto * t : l0_tensors) {
-            if (t && t->data) {
-                posix_madvise(t->data, ggml_nbytes(t), POSIX_MADV_WILLNEED);
-            }
-        }
-        LLAMA_LOG_INFO("%s: prefetch_compute_weights: issued MADV_WILLNEED for layer 0 attention weights\n", __func__);
-    }
-#endif
-
-    // BSC: apply MADV_RANDOM to disable kernel speculative readahead on page faults
-#ifdef __linux__
-    if (params.madvise_random) {
-        for (auto & mapping : pimpl->mappings) {
-            if (posix_madvise(mapping->addr(), mapping->size(), POSIX_MADV_RANDOM)) {
-                LLAMA_LOG_WARN("%s: posix_madvise(POSIX_MADV_RANDOM) failed: %s\n", __func__, strerror(errno));
-            }
-        }
-        LLAMA_LOG_INFO("%s: madvise_random: applied POSIX_MADV_RANDOM to %zu mapping(s) — kernel readahead disabled\n", __func__, pimpl->mappings.size());
-    }
 #endif
 
     // BSC: capture T4 — pinning done (or same as T3 if not pinning)
@@ -8226,12 +8189,10 @@ llama_model_params llama_model_default_params() {
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,
         /*.pin_compute_weights         =*/ false,
-        /*.moe_prefetch                =*/ false,
-        /*.madvise_random              =*/ false,
-        /*.prefetch_compute_weights    =*/ false,
-        /*.uring_experts               =*/ false,
-        /*.uring_overlap               =*/ false,
-        /*.uring_pipeline              =*/ false,
+        /*.uring_experts                       =*/ false,
+        /*.uring_projection_overlap            =*/ false,
+        /*.uring_async_projection_overlap      =*/ false,
+        /*.uring_async_experts                 =*/ false,
         /*.uring_cache_slots           =*/ 0,
         /*.uring_cache_policy          =*/ 0,
         /*.uring_aging_mult            =*/ 10,

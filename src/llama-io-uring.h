@@ -75,6 +75,64 @@ int llama_io_uring_read_sync(
         const struct llama_io_uring_read_req * reqs,
         int                                n_reqs);
 
+// --- Tagged I/O (for async pipelining: submit at high QD, wait selectively) ---
+//
+// Tags encode which logical group a read belongs to. submit_phased() stores
+// the tag in the high bits of sqe->user_data. wait_phase() drains CQEs but
+// only counts completions matching the requested tag; non-matching CQEs are
+// "parked" internally and consumed by a subsequent wait_phase() for another tag.
+//
+// Tag layout depends on the active flag:
+//   --uring-async-projection-overlap : 8 tags = 4 experts x {upgate-pair, down}
+//   --uring-async-experts            : 12 tags = 4 experts x {up, gate, down}
+
+// Tag range: 0-15 (4 bits stored in user_data bits 60-63).
+// 16 tags lets --uring-async-experts address each (expert, projection)
+// pair separately (up to 4 experts x 3 projections = 12 distinct tags).
+#define LLAMA_IO_URING_MAX_TAGS     16
+
+// Submit reads tagged with a phase. Same as llama_io_uring_submit but encodes
+// the phase in user_data for later filtering by wait_phase.
+int llama_io_uring_submit_phased(
+        struct llama_io_uring_context        * ctx,
+        const struct llama_io_uring_read_req * reqs,
+        int                                    n_reqs,
+        int                                    phase_tag);
+
+// Wait for n_expected completions with the given phase_tag. Completions from
+// other phases that arrive are parked and will be consumed by a later
+// wait_phase() call with the matching tag. Returns 0 on success, -1 on error.
+int llama_io_uring_wait_phase(
+        struct llama_io_uring_context * ctx,
+        int                            phase_tag,
+        int                            n_expected);
+
+// Reset parked-completion counters. Call once per layer before submitting.
+void llama_io_uring_reset_phases(struct llama_io_uring_context * ctx);
+
+// Wait until ONE of the watched tags has received its n_expected CQEs.
+// tags[]       : array of LLAMA_IO_URING tag values to watch (each 0..7)
+// n_expected_per_tag[] : how many CQEs to wait for on each respective tag
+// n_tags       : length of the above arrays (must be <= LLAMA_IO_URING_MAX_TAGS)
+//
+// Semantics:
+//   - Consumes parked CQEs for each watched tag first.
+//   - If any watched tag is already at its required count, returns its index
+//     without draining the ring.
+//   - Otherwise drains CQEs from the ring. CQEs for tags NOT in the watched
+//     list are parked for later. CQEs for watched tags increment their count.
+//   - First watched tag to reach n_expected_per_tag wins and is returned as
+//     the index (0..n_tags-1) in the `tags` array.
+//   - Partial consumption for losing tags is refunded to parked[], so
+//     subsequent wait_phase / wait_any calls see the correct count.
+//
+// Returns index into tags[] on success, or -1 on error.
+int llama_io_uring_wait_any_tag_ready(
+        struct llama_io_uring_context * ctx,
+        const int                     * tags,
+        const int                     * n_expected_per_tag,
+        int                             n_tags);
+
 // --- Metrics ---
 
 struct llama_io_uring_metrics {
