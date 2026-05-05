@@ -137,3 +137,9 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Local AI helper file (not part of the project)
+CLAUDE.md
+
+# BSC sidecar pack files (large, derivable from the GGUF)
+*.bscexp
